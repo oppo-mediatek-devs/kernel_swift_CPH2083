@@ -1393,9 +1393,11 @@ static inline void nvme_release_cmb(struct nvme_dev *dev)
 	if (dev->cmb) {
 		iounmap(dev->cmb);
 		dev->cmb = NULL;
-		sysfs_remove_file_from_group(&dev->ctrl.device->kobj,
-					     &dev_attr_cmb.attr, NULL);
-		dev->cmbsz = 0;
+		if (dev->cmbsz) {
+			sysfs_remove_file_from_group(&dev->ctrl.device->kobj,
+						     &dev_attr_cmb.attr, NULL);
+			dev->cmbsz = 0;
+		}
 	}
 }
 
@@ -1630,14 +1632,16 @@ static int nvme_pci_enable(struct nvme_dev *dev)
 
 	/*
 	 * CMBs can currently only exist on >=1.2 PCIe devices. We only
-	 * populate sysfs if a CMB is implemented. Since nvme_dev_attrs_group
-	 * has no name we can pass NULL as final argument to
-	 * sysfs_add_file_to_group.
+	 * populate sysfs if a CMB is implemented. Note that we add the
+	 * CMB attribute to the nvme_ctrl kobj which removes the need to remove
+	 * it on exit. Since nvme_dev_attrs_group has no name we can pass
+	 * NULL as final argument to sysfs_add_file_to_group.
 	 */
 
 	if (readl(dev->bar + NVME_REG_VS) >= NVME_VS(1, 2, 0)) {
 		dev->cmb = nvme_map_cmb(dev);
-		if (dev->cmb) {
+
+		if (dev->cmbsz) {
 			if (sysfs_add_file_to_group(&dev->ctrl.device->kobj,
 						    &dev_attr_cmb.attr, NULL))
 				dev_warn(dev->dev,
@@ -1863,7 +1867,7 @@ static int nvme_pci_reg_write32(struct nvme_ctrl *ctrl, u32 off, u32 val)
 
 static int nvme_pci_reg_read64(struct nvme_ctrl *ctrl, u32 off, u64 *val)
 {
-	*val = lo_hi_readq(to_nvme_dev(ctrl)->bar + off);
+	*val = readq(to_nvme_dev(ctrl)->bar + off);
 	return 0;
 }
 
@@ -1927,7 +1931,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	result = nvme_dev_map(dev);
 	if (result)
-		goto put_pci;
+		goto free;
 
 	INIT_WORK(&dev->reset_work, nvme_reset_work);
 	INIT_WORK(&dev->remove_work, nvme_remove_dead_ctrl_work);
@@ -1938,7 +1942,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	result = nvme_setup_prp_pools(dev);
 	if (result)
-		goto unmap;
+		goto put_pci;
 
 	result = nvme_init_ctrl(&dev->ctrl, &pdev->dev, &nvme_pci_ctrl_ops,
 			id->driver_data);
@@ -1953,10 +1957,9 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
  release_pools:
 	nvme_release_prp_pools(dev);
- unmap:
-	nvme_dev_unmap(dev);
  put_pci:
 	put_device(dev->dev);
+	nvme_dev_unmap(dev);
  free:
 	kfree(dev->queues);
 	kfree(dev);

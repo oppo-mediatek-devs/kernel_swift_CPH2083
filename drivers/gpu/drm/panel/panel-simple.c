@@ -557,6 +557,35 @@ static const struct panel_desc auo_b133htn01 = {
 	},
 };
 
+static const struct drm_display_mode auo_g133han01_mode = {
+	.clock = 141200,
+	.hdisplay = 1920,
+	.hsync_start = 1920 + 108,
+	.hsync_end = 1920 + 108 + 20,
+	.htotal = 1920 + 108 + 20 + 60,
+	.vdisplay = 1080,
+	.vsync_start = 1080 + 16,
+	.vsync_end = 1080 + 16 + 10,
+	.vtotal = 1080 + 16 + 10 + 10,
+	.vrefresh = 60,
+};
+
+static const struct panel_desc auo_g133han01 = {
+	.modes = &auo_g133han01_mode,
+	.num_modes = 1,
+	.bpc = 8,
+	.size = {
+		.width = 293,
+		.height = 165,
+	},
+	.delay = {
+		.prepare = 200,
+		.enable = 50,
+		.disable = 50,
+		.unprepare = 20,
+	},
+};
+
 static const struct drm_display_mode avic_tm070ddh03_mode = {
 	.clock = 51200,
 	.hdisplay = 1024,
@@ -1041,7 +1070,7 @@ static const struct drm_display_mode lg_lb070wv8_mode = {
 static const struct panel_desc lg_lb070wv8 = {
 	.modes = &lg_lb070wv8_mode,
 	.num_modes = 1,
-	.bpc = 8,
+	.bpc = 16,
 	.size = {
 		.width = 151,
 		.height = 91,
@@ -1577,6 +1606,9 @@ static const struct of_device_id platform_of_match[] = {
 		.compatible = "auo,b133xtn01",
 		.data = &auo_b133xtn01,
 	}, {
+		.compatible = "auo,g133han01",
+		.data = &auo_g133han01,
+	}, {
 		.compatible = "avic,tm070ddh03",
 		.data = &avic_tm070ddh03,
 	}, {
@@ -1944,14 +1976,7 @@ static int panel_simple_dsi_probe(struct mipi_dsi_device *dsi)
 	dsi->format = desc->format;
 	dsi->lanes = desc->lanes;
 
-	err = mipi_dsi_attach(dsi);
-	if (err) {
-		struct panel_simple *panel = dev_get_drvdata(&dsi->dev);
-
-		drm_panel_remove(&panel->base);
-	}
-
-	return err;
+	return mipi_dsi_attach(dsi);
 }
 
 static int panel_simple_dsi_remove(struct mipi_dsi_device *dsi)

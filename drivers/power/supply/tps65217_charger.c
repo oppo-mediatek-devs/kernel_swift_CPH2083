@@ -238,7 +238,7 @@ static int tps65217_charger_probe(struct platform_device *pdev)
 	if (irq != -ENXIO) {
 		ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
 						tps65217_charger_irq,
-						IRQF_ONESHOT, "tps65217-charger",
+						0, "tps65217-charger",
 						charger);
 		if (ret) {
 			dev_err(charger->dev,

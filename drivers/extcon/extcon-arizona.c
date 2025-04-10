@@ -601,7 +601,7 @@ static irqreturn_t arizona_hpdet_irq(int irq, void *data)
 	struct arizona *arizona = info->arizona;
 	int id_gpio = arizona->pdata.hpdet_id_gpio;
 	unsigned int report = EXTCON_JACK_HEADPHONE;
-	int ret, reading, state;
+	int ret, reading;
 	bool mic = false;
 
 	mutex_lock(&info->lock);
@@ -614,11 +614,12 @@ static irqreturn_t arizona_hpdet_irq(int irq, void *data)
 	}
 
 	/* If the cable was removed while measuring ignore the result */
-	state = extcon_get_state(info->edev, EXTCON_MECHANICAL);
-	if (state < 0) {
-		dev_err(arizona->dev, "Failed to check cable state: %d\n", state);
+	ret = extcon_get_state(info->edev, EXTCON_MECHANICAL);
+	if (ret < 0) {
+		dev_err(arizona->dev, "Failed to check cable state: %d\n",
+			ret);
 		goto out;
-	} else if (!state) {
+	} else if (!ret) {
 		dev_dbg(arizona->dev, "Ignoring HPDET for removed cable\n");
 		goto done;
 	}
@@ -671,7 +672,7 @@ done:
 			   ARIZONA_ACCDET_MODE_MASK, ARIZONA_ACCDET_MODE_MIC);
 
 	/* If we have a mic then reenable MICDET */
-	if (state && (mic || info->mic))
+	if (mic || info->mic)
 		arizona_start_mic(info);
 
 	if (info->hpdet_active) {
@@ -679,9 +680,7 @@ done:
 		info->hpdet_active = false;
 	}
 
-	/* Do not set hp_det done when the cable has been unplugged */
-	if (state)
-		info->hpdet_done = true;
+	info->hpdet_done = true;
 
 out:
 	mutex_unlock(&info->lock);
@@ -1685,16 +1684,6 @@ static int arizona_extcon_remove(struct platform_device *pdev)
 	struct arizona_extcon_info *info = platform_get_drvdata(pdev);
 	struct arizona *arizona = info->arizona;
 	int jack_irq_rise, jack_irq_fall;
-	bool change;
-
-	regmap_update_bits_check(arizona->regmap, ARIZONA_MIC_DETECT_1,
-				 ARIZONA_MICD_ENA, 0,
-				 &change);
-
-	if (change) {
-		regulator_disable(info->micvdd);
-		pm_runtime_put(info->dev);
-	}
 
 	gpiod_put(info->micd_pol_gpio);
 

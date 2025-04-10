@@ -397,13 +397,12 @@ config I2C_BCM_KONA
 	  If you do not need KONA I2C interface, say N.
 
 config I2C_BRCMSTB
-	tristate "BRCM Settop/DSL I2C controller"
-	depends on ARCH_BRCMSTB || BMIPS_GENERIC || ARCH_BCM_63XX || \
-		   COMPILE_TEST
+	tristate "BRCM Settop I2C controller"
+	depends on ARCH_BRCMSTB || BMIPS_GENERIC || COMPILE_TEST
 	default y
 	help
 	  If you say yes to this option, support will be included for the
-	  I2C interface on the Broadcom Settop/DSL SoCs.
+	  I2C interface on the Broadcom Settop SoCs.
 
 	  If you do not need I2C interface, say N.
 
@@ -662,6 +661,15 @@ config I2C_MT65XX
 	help
 	  This selects the MediaTek(R) Integrated Inter Circuit bus driver
 	  for MT65xx and MT81xx.
+	  If you want to use MediaTek(R) I2C interface, say Y or M here.
+	  If unsure, say N.
+
+config I2C_MTK
+	tristate "MediaTek I2C Driver"
+	default n
+	---help---
+	  This selects the MediaTek(R) Integrated Inter Circuit bus driver.
+	  MediaTek(R) I2C bus adapter is the base for some other I2C client, eg: touch, sensors.
 	  If you want to use MediaTek(R) I2C interface, say Y or M here.
 	  If unsure, say N.
 

@@ -1020,7 +1020,6 @@ static void _stop(struct pl330_thread *thrd)
 {
 	void __iomem *regs = thrd->dmac->base;
 	u8 insn[6] = {0, 0, 0, 0, 0, 0};
-	u32 inten = readl(regs + INTEN);
 
 	if (_state(thrd) == PL330_STATE_FAULT_COMPLETING)
 		UNTIL(thrd, PL330_STATE_FAULTING | PL330_STATE_KILLING);
@@ -1033,13 +1032,10 @@ static void _stop(struct pl330_thread *thrd)
 
 	_emit_KILL(0, insn);
 
-	_execute_DBGINSN(thrd, insn, is_manager(thrd));
-
-	/* clear the event */
-	if (inten & (1 << thrd->ev))
-		writel(1 << thrd->ev, regs + INTCLR);
 	/* Stop generating interrupts for SEV */
-	writel(inten & ~(1 << thrd->ev), regs + INTEN);
+	writel(readl(regs + INTEN) & ~(1 << thrd->ev), regs + INTEN);
+
+	_execute_DBGINSN(thrd, insn, is_manager(thrd));
 }
 
 /* Start doing req 'idx' of thread 'thrd' */
@@ -2171,14 +2167,13 @@ static int pl330_terminate_all(struct dma_chan *chan)
 
 	pm_runtime_get_sync(pl330->ddma.dev);
 	spin_lock_irqsave(&pch->lock, flags);
-
 	spin_lock(&pl330->lock);
 	_stop(pch->thread);
+	spin_unlock(&pl330->lock);
+
 	pch->thread->req[0].desc = NULL;
 	pch->thread->req[1].desc = NULL;
 	pch->thread->req_running = -1;
-	spin_unlock(&pl330->lock);
-
 	power_down = pch->active;
 	pch->active = false;
 
@@ -2579,15 +2574,13 @@ static struct dma_async_tx_descriptor *pl330_prep_dma_cyclic(
 	for (i = 0; i < len / period_len; i++) {
 		desc = pl330_get_desc(pch);
 		if (!desc) {
-			unsigned long iflags;
-
 			dev_err(pch->dmac->ddma.dev, "%s:%d Unable to fetch desc\n",
 				__func__, __LINE__);
 
 			if (!first)
 				return NULL;
 
-			spin_lock_irqsave(&pl330->pool_lock, iflags);
+			spin_lock_irqsave(&pl330->pool_lock, flags);
 
 			while (!list_empty(&first->node)) {
 				desc = list_entry(first->node.next,
@@ -2597,7 +2590,7 @@ static struct dma_async_tx_descriptor *pl330_prep_dma_cyclic(
 
 			list_move_tail(&first->node, &pl330->desc_pool);
 
-			spin_unlock_irqrestore(&pl330->pool_lock, iflags);
+			spin_unlock_irqrestore(&pl330->pool_lock, flags);
 
 			return NULL;
 		}
@@ -2679,14 +2672,14 @@ pl330_prep_dma_memcpy(struct dma_chan *chan, dma_addr_t dst,
 	while (burst != (1 << desc->rqcfg.brst_size))
 		desc->rqcfg.brst_size++;
 
-	desc->rqcfg.brst_len = get_burst_len(desc, len);
 	/*
 	 * If burst size is smaller than bus width then make sure we only
 	 * transfer one at a time to avoid a burst stradling an MFIFO entry.
 	 */
-	if (burst * 8 < pl330->pcfg.data_bus_width)
+	if (desc->rqcfg.brst_size * 8 < pl330->pcfg.data_bus_width)
 		desc->rqcfg.brst_len = 1;
 
+	desc->rqcfg.brst_len = get_burst_len(desc, len);
 	desc->bytes_requested = len;
 
 	desc->txd.flags = flags;
@@ -2958,7 +2951,7 @@ pl330_probe(struct amba_device *adev, const struct amba_id *id)
 	pd->src_addr_widths = PL330_DMA_BUSWIDTHS;
 	pd->dst_addr_widths = PL330_DMA_BUSWIDTHS;
 	pd->directions = BIT(DMA_DEV_TO_MEM) | BIT(DMA_MEM_TO_DEV);
-	pd->residue_granularity = DMA_RESIDUE_GRANULARITY_BURST;
+	pd->residue_granularity = DMA_RESIDUE_GRANULARITY_SEGMENT;
 	pd->max_burst = ((pl330->quirks & PL330_QUIRK_BROKEN_NO_FLUSHP) ?
 			 1 : PL330_MAX_BURST);
 

@@ -775,9 +775,6 @@ static int smsc95xx_ethtool_set_wol(struct net_device *net,
 	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
 	int ret;
 
-	if (wolinfo->wolopts & ~SUPPORTED_WAKE)
-		return -EINVAL;
-
 	pdata->wolopts = wolinfo->wolopts & SUPPORTED_WAKE;
 
 	ret = device_set_wakeup_enable(&dev->udev->dev, pdata->wolopts);
@@ -1292,14 +1289,11 @@ static int smsc95xx_bind(struct usbnet *dev, struct usb_interface *intf)
 
 	/* Init all registers */
 	ret = smsc95xx_reset(dev);
-	if (ret)
-		goto free_pdata;
 
 	/* detect device revision as different features may be available */
 	ret = smsc95xx_read_reg(dev, ID_REV, &val);
 	if (ret < 0)
-		goto free_pdata;
-
+		return ret;
 	val >>= 16;
 	pdata->chip_id = val;
 	pdata->mdix_ctrl = get_mdix_status(dev->net);
@@ -1323,10 +1317,6 @@ static int smsc95xx_bind(struct usbnet *dev, struct usb_interface *intf)
 	schedule_delayed_work(&pdata->carrier_check, CARRIER_CHECK_DELAY);
 
 	return 0;
-
-free_pdata:
-	kfree(pdata);
-	return ret;
 }
 
 static void smsc95xx_unbind(struct usbnet *dev, struct usb_interface *intf)
@@ -1334,7 +1324,7 @@ static void smsc95xx_unbind(struct usbnet *dev, struct usb_interface *intf)
 	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
 
 	if (pdata) {
-		cancel_delayed_work_sync(&pdata->carrier_check);
+		cancel_delayed_work(&pdata->carrier_check);
 		netif_dbg(dev, ifdown, dev->net, "free pdata\n");
 		kfree(pdata);
 		pdata = NULL;
@@ -1597,8 +1587,6 @@ static int smsc95xx_suspend(struct usb_interface *intf, pm_message_t message)
 		return ret;
 	}
 
-	cancel_delayed_work_sync(&pdata->carrier_check);
-
 	if (pdata->suspend_flags) {
 		netdev_warn(dev->net, "error during last resume\n");
 		pdata->suspend_flags = 0;
@@ -1841,11 +1829,6 @@ done:
 	 */
 	if (ret && PMSG_IS_AUTO(message))
 		usbnet_resume(intf);
-
-	if (ret)
-		schedule_delayed_work(&pdata->carrier_check,
-				      CARRIER_CHECK_DELAY);
-
 	return ret;
 }
 
@@ -2018,13 +2001,13 @@ static struct sk_buff *smsc95xx_tx_fixup(struct usbnet *dev,
 	/* We do not advertise SG, so skbs should be already linearized */
 	BUG_ON(skb_shinfo(skb)->nr_frags);
 
-	/* Make writable and expand header space by overhead if required */
-	if (skb_cow_head(skb, overhead)) {
-		/* Must deallocate here as returning NULL to indicate error
-		 * means the skb won't be deallocated in the caller.
-		 */
+	if (skb_headroom(skb) < overhead) {
+		struct sk_buff *skb2 = skb_copy_expand(skb,
+			overhead, 0, flags);
 		dev_kfree_skb_any(skb);
-		return NULL;
+		skb = skb2;
+		if (!skb)
+			return NULL;
 	}
 
 	if (csum) {

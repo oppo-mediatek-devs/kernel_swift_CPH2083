@@ -9,7 +9,6 @@ menu "Serial drivers"
 
 config SERIAL_EARLYCON
 	bool
-	depends on SERIAL_CORE
 	help
 	  Support for early consoles with the earlycon parameter. This enables
 	  the console before standard serial driver is probed. The console is
@@ -1635,6 +1634,16 @@ config SERIAL_STM32
 	  It support all industry standard baud rates.
 
 	  If unsure, say N.
+
+config SERIAL_MTK_EARLY_CONSOLE
+	bool "Support for MTK Early Console"
+	select SERIAL_CORE_CONSOLE
+	select SERIAL_EARLYCON
+	help
+	  This driver is for MTK EARLY Console Feature Support
+	  It is for MTK Chip Use
+	  It can show 0 sec log
+	  It is easy for debugging bringup issue
 
 config SERIAL_STM32_CONSOLE
 	bool "Support for console on STM32"

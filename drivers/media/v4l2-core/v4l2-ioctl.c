@@ -1269,6 +1269,7 @@ static void v4l_fill_fmtdesc(struct v4l2_fmtdesc *fmt)
 		case V4L2_PIX_FMT_VC1_ANNEX_G:	descr = "VC-1 (SMPTE 412M Annex G)"; break;
 		case V4L2_PIX_FMT_VC1_ANNEX_L:	descr = "VC-1 (SMPTE 412M Annex L)"; break;
 		case V4L2_PIX_FMT_VP8:		descr = "VP8"; break;
+		case V4L2_PIX_FMT_VP9:		descr = "VP9"; break;
 		case V4L2_PIX_FMT_CPIA1:	descr = "GSPCA CPiA YUV"; break;
 		case V4L2_PIX_FMT_WNVA:		descr = "WNVA"; break;
 		case V4L2_PIX_FMT_SN9C10X:	descr = "GSPCA SN9C10X"; break;
@@ -1287,6 +1288,40 @@ static void v4l_fill_fmtdesc(struct v4l2_fmtdesc *fmt)
 		case V4L2_PIX_FMT_JPGL:		descr = "JPEG Lite"; break;
 		case V4L2_PIX_FMT_SE401:	descr = "GSPCA SE401"; break;
 		case V4L2_PIX_FMT_S5C_UYVY_JPG:	descr = "S5C73MX interleaved UYVY/JPEG"; break;
+		case V4L2_PIX_FMT_DIVX:		descr = "DIVX"; break;
+		case V4L2_PIX_FMT_DIVX3:	descr = "DIVX3"; break;
+		case V4L2_PIX_FMT_DIVX4:	descr = "DIVX4"; break;
+		case V4L2_PIX_FMT_DIVX5:	descr = "DIVX5"; break;
+		case V4L2_PIX_FMT_DIVX6:	descr = "DIVX6"; break;
+		case V4L2_PIX_FMT_H265:		descr = "H.265"; break;
+		case V4L2_PIX_FMT_HEIF:
+			descr = "HEIF"; break;
+		case V4L2_PIX_FMT_S263:		descr = "S.263"; break;
+		case V4L2_PIX_FMT_WMV1:		descr = "WMV1"; break;
+		case V4L2_PIX_FMT_WMV2:		descr = "WMV2"; break;
+		case V4L2_PIX_FMT_WMV3:		descr = "WMV3"; break;
+		case V4L2_PIX_FMT_WVC1:		descr = "WVC1"; break;
+		case V4L2_PIX_FMT_WMVA:		descr = "WMVA"; break;
+		case V4L2_PIX_FMT_RV30:		descr = "RealVideo 8"; break;
+		case V4L2_PIX_FMT_RV40:		descr = "RealVideo 9/10"; break;
+		case V4L2_PIX_FMT_MT21C:
+		case V4L2_PIX_FMT_MT21:
+		case V4L2_PIX_FMT_MT2110T:
+		case V4L2_PIX_FMT_MT2110R:
+		case V4L2_PIX_FMT_MT21C10T:
+		case V4L2_PIX_FMT_MT21C10R:
+		case V4L2_PIX_FMT_MT21CS:
+		case V4L2_PIX_FMT_MT21S:
+		case V4L2_PIX_FMT_MT21S10T:
+		case V4L2_PIX_FMT_MT21S10R:
+		case V4L2_PIX_FMT_MT21CS10T:
+		case V4L2_PIX_FMT_MT21CS10R:
+		case V4L2_PIX_FMT_MT21CSA:
+		case V4L2_PIX_FMT_MT21S10TJ:
+		case V4L2_PIX_FMT_MT21S10RJ:
+		case V4L2_PIX_FMT_MT21CS10TJ:
+		case V4L2_PIX_FMT_MT21CS10RJ:
+			descr = "Mediatek Video Block Format"; break;
 		default:
 			WARN(1, "Unknown pixelformat 0x%08x\n", fmt->pixelformat);
 			if (fmt->description[0])
@@ -1959,22 +1994,7 @@ static int v4l_s_parm(const struct v4l2_ioctl_ops *ops,
 	struct v4l2_streamparm *p = arg;
 	int ret = check_fmt(file, p->type);
 
-	if (ret)
-		return ret;
-
-	/* Note: extendedmode is never used in drivers */
-	if (V4L2_TYPE_IS_OUTPUT(p->type)) {
-		memset(p->parm.output.reserved, 0,
-		       sizeof(p->parm.output.reserved));
-		p->parm.output.extendedmode = 0;
-		p->parm.output.outputmode &= V4L2_MODE_HIGHQUALITY;
-	} else {
-		memset(p->parm.capture.reserved, 0,
-		       sizeof(p->parm.capture.reserved));
-		p->parm.capture.extendedmode = 0;
-		p->parm.capture.capturemode &= V4L2_MODE_HIGHQUALITY;
-	}
-	return ops->vidioc_s_parm(file, fh, p);
+	return ret ? ret : ops->vidioc_s_parm(file, fh, p);
 }
 
 static int v4l_queryctrl(const struct v4l2_ioctl_ops *ops,
@@ -2825,7 +2845,7 @@ video_usercopy(struct file *file, unsigned int cmd, unsigned long arg,
 	       v4l2_kioctl func)
 {
 	char	sbuf[128];
-	void    *mbuf = NULL, *array_buf = NULL;
+	void    *mbuf = NULL;
 	void	*parg = (void *)arg;
 	long	err  = -EINVAL;
 	bool	has_array_args;
@@ -2880,14 +2900,20 @@ video_usercopy(struct file *file, unsigned int cmd, unsigned long arg,
 	has_array_args = err;
 
 	if (has_array_args) {
-		array_buf = kmalloc(array_size, GFP_KERNEL);
+		/*
+		 * When adding new types of array args, make sure that the
+		 * parent argument to ioctl (which contains the pointer to the
+		 * array) fits into sbuf (so that mbuf will still remain
+		 * unused up to here).
+		 */
+		mbuf = kmalloc(array_size, GFP_KERNEL);
 		err = -ENOMEM;
-		if (array_buf == NULL)
+		if (NULL == mbuf)
 			goto out_array_args;
 		err = -EFAULT;
-		if (copy_from_user(array_buf, user_ptr, array_size))
+		if (copy_from_user(mbuf, user_ptr, array_size))
 			goto out_array_args;
-		*kernel_ptr = array_buf;
+		*kernel_ptr = mbuf;
 	}
 
 	/* Handles IOCTL */
@@ -2906,7 +2932,7 @@ video_usercopy(struct file *file, unsigned int cmd, unsigned long arg,
 
 	if (has_array_args) {
 		*kernel_ptr = (void __force *)user_ptr;
-		if (copy_to_user(user_ptr, array_buf, array_size))
+		if (copy_to_user(user_ptr, mbuf, array_size))
 			err = -EFAULT;
 		goto out_array_args;
 	}
@@ -2926,7 +2952,6 @@ out_array_args:
 	}
 
 out:
-	kfree(array_buf);
 	kfree(mbuf);
 	return err;
 }

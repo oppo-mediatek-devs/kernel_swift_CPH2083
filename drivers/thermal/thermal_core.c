@@ -396,11 +396,13 @@ static void thermal_zone_device_set_polling(struct thermal_zone_device *tz,
 					    int delay)
 {
 	if (delay > 1000)
-		mod_delayed_work(system_freezable_wq, &tz->poll_queue,
-				 round_jiffies(msecs_to_jiffies(delay)));
+		mod_delayed_work(system_freezable_power_efficient_wq,
+					&tz->poll_queue,
+					round_jiffies(msecs_to_jiffies(delay)));
 	else if (delay)
-		mod_delayed_work(system_freezable_wq, &tz->poll_queue,
-				 msecs_to_jiffies(delay));
+		mod_delayed_work(system_freezable_power_efficient_wq,
+					&tz->poll_queue,
+					msecs_to_jiffies(delay));
 	else
 		cancel_delayed_work(&tz->poll_queue);
 }
@@ -597,20 +599,14 @@ static void update_temperature(struct thermal_zone_device *tz)
 			tz->last_temperature, tz->temperature);
 }
 
-static void thermal_zone_device_init(struct thermal_zone_device *tz)
-{
-	struct thermal_instance *pos;
-	tz->temperature = THERMAL_TEMP_INVALID;
-	tz->prev_low_trip = -INT_MAX;
-	tz->prev_high_trip = INT_MAX;
-	list_for_each_entry(pos, &tz->thermal_instances, tz_node)
-		pos->initialized = false;
-}
-
 static void thermal_zone_device_reset(struct thermal_zone_device *tz)
 {
+	struct thermal_instance *pos;
+
+	tz->temperature = THERMAL_TEMP_INVALID;
 	tz->passive = 0;
-	thermal_zone_device_init(tz);
+	list_for_each_entry(pos, &tz->thermal_instances, tz_node)
+		pos->initialized = false;
 }
 
 void thermal_zone_device_update(struct thermal_zone_device *tz,
@@ -2005,14 +2001,14 @@ struct thermal_zone_device *thermal_zone_device_register(const char *type,
 			goto unregister;
 	}
 
+	INIT_DELAYED_WORK(&(tz->poll_queue), thermal_zone_device_check);
+
 	mutex_lock(&thermal_list_lock);
 	list_add_tail(&tz->node, &thermal_tz_list);
 	mutex_unlock(&thermal_list_lock);
 
 	/* Bind cooling devices for this zone */
 	bind_tz(tz);
-
-	INIT_DELAYED_WORK(&(tz->poll_queue), thermal_zone_device_check);
 
 	thermal_zone_device_reset(tz);
 	/* Update the new thermal zone and mark it as already updated. */
@@ -2029,7 +2025,7 @@ unregister:
 EXPORT_SYMBOL_GPL(thermal_zone_device_register);
 
 /**
- * thermal_zone_device_unregister - removes the registered thermal zone device
+ * thermal_device_unregister - removes the registered thermal zone device
  * @tz: the thermal zone device to remove
  */
 void thermal_zone_device_unregister(struct thermal_zone_device *tz)
@@ -2045,6 +2041,12 @@ void thermal_zone_device_unregister(struct thermal_zone_device *tz)
 	tzp = tz->tzp;
 
 	mutex_lock(&thermal_list_lock);
+
+	tz->polling_delay = 0;
+
+	/* force stop pending/running delayed work*/
+	cancel_delayed_work_sync(&(tz->poll_queue));
+
 	list_for_each_entry(pos, &thermal_tz_list, node)
 	    if (pos == tz)
 		break;
@@ -2075,7 +2077,7 @@ void thermal_zone_device_unregister(struct thermal_zone_device *tz)
 
 	mutex_unlock(&thermal_list_lock);
 
-	cancel_delayed_work_sync(&tz->poll_queue);
+	/* thermal_zone_device_set_polling(tz, 0); */
 
 	if (tz->type[0])
 		device_remove_file(&tz->device, &dev_attr_type);
@@ -2302,11 +2304,13 @@ static int thermal_pm_notify(struct notifier_block *nb,
 	case PM_POST_RESTORE:
 	case PM_POST_SUSPEND:
 		atomic_set(&in_suspend, 0);
+		mutex_lock(&thermal_list_lock);
 		list_for_each_entry(tz, &thermal_tz_list, node) {
-			thermal_zone_device_init(tz);
+			thermal_zone_device_reset(tz);
 			thermal_zone_device_update(tz,
 						   THERMAL_EVENT_UNSPECIFIED);
 		}
+		mutex_unlock(&thermal_list_lock);
 		break;
 	default:
 		break;

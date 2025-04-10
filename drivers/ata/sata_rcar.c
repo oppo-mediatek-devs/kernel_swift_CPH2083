@@ -122,7 +122,7 @@
 /* Descriptor table word 0 bit (when DTA32M = 1) */
 #define SATA_RCAR_DTEND			BIT(0)
 
-#define SATA_RCAR_DMA_BOUNDARY		0x1FFFFFFFUL
+#define SATA_RCAR_DMA_BOUNDARY		0x1FFFFFFEUL
 
 /* Gen2 Physical Layer Control Registers */
 #define RCAR_GEN2_PHY_CTL1_REG		0x1704
@@ -551,14 +551,12 @@ static void sata_rcar_bmdma_fill_sg(struct ata_queued_cmd *qc)
 	prd[si - 1].addr |= cpu_to_le32(SATA_RCAR_DTEND);
 }
 
-static enum ata_completion_errors sata_rcar_qc_prep(struct ata_queued_cmd *qc)
+static void sata_rcar_qc_prep(struct ata_queued_cmd *qc)
 {
 	if (!(qc->flags & ATA_QCFLAG_DMAMAP))
-		return AC_ERR_OK;
+		return;
 
 	sata_rcar_bmdma_fill_sg(qc);
-
-	return AC_ERR_OK;
 }
 
 static void sata_rcar_bmdma_setup(struct ata_queued_cmd *qc)
@@ -874,9 +872,7 @@ static int sata_rcar_probe(struct platform_device *pdev)
 	int ret = 0;
 
 	irq = platform_get_irq(pdev, 0);
-	if (irq < 0)
-		return irq;
-	if (!irq)
+	if (irq <= 0)
 		return -EINVAL;
 
 	priv = devm_kzalloc(&pdev->dev, sizeof(struct sata_rcar_priv),
@@ -894,10 +890,7 @@ static int sata_rcar_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "failed to get access to sata clock\n");
 		return PTR_ERR(priv->clk);
 	}
-
-	ret = clk_prepare_enable(priv->clk);
-	if (ret)
-		return ret;
+	clk_prepare_enable(priv->clk);
 
 	host = ata_host_alloc(&pdev->dev, 1);
 	if (!host) {
@@ -977,11 +970,8 @@ static int sata_rcar_resume(struct device *dev)
 	struct ata_host *host = dev_get_drvdata(dev);
 	struct sata_rcar_priv *priv = host->private_data;
 	void __iomem *base = priv->base;
-	int ret;
 
-	ret = clk_prepare_enable(priv->clk);
-	if (ret)
-		return ret;
+	clk_prepare_enable(priv->clk);
 
 	/* ack and mask */
 	iowrite32(0, base + SATAINTSTAT_REG);
@@ -998,11 +988,8 @@ static int sata_rcar_restore(struct device *dev)
 {
 	struct ata_host *host = dev_get_drvdata(dev);
 	struct sata_rcar_priv *priv = host->private_data;
-	int ret;
 
-	ret = clk_prepare_enable(priv->clk);
-	if (ret)
-		return ret;
+	clk_prepare_enable(priv->clk);
 
 	sata_rcar_setup_port(host);
 

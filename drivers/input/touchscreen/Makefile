@@ -50,6 +50,7 @@ obj-$(CONFIG_TOUCHSCREEN_MX25)		+= fsl-imx25-tcq.o
 obj-$(CONFIG_TOUCHSCREEN_MC13783)	+= mc13783_ts.o
 obj-$(CONFIG_TOUCHSCREEN_MCS5000)	+= mcs5000_ts.o
 obj-$(CONFIG_TOUCHSCREEN_MELFAS_MIP4)	+= melfas_mip4.o
+obj-$(CONFIG_TOUCHSCREEN_MTK)		+= mediatek/
 obj-$(CONFIG_TOUCHSCREEN_MIGOR)		+= migor_ts.o
 obj-$(CONFIG_TOUCHSCREEN_MMS114)	+= mms114.o
 obj-$(CONFIG_TOUCHSCREEN_MTOUCH)	+= mtouch.o
@@ -99,3 +100,8 @@ obj-$(CONFIG_TOUCHSCREEN_TPS6507X)	+= tps6507x-ts.o
 obj-$(CONFIG_TOUCHSCREEN_ZFORCE)	+= zforce_ts.o
 obj-$(CONFIG_TOUCHSCREEN_COLIBRI_VF50)	+= colibri-vf50-ts.o
 obj-$(CONFIG_TOUCHSCREEN_ROHM_BU21023)	+= rohm_bu21023.o
+
+#ifdef ODM_HQ_EDIT
+obj-$(CONFIG_TOUCHPANEL_OPPO)		+= oppo_touchscreen/
+obj-$(CONFIG_TOUCHPANEL_OPPO)		+= touch.o
+#endif

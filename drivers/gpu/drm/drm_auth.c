@@ -133,7 +133,6 @@ static int drm_new_set_master(struct drm_device *dev, struct drm_file *fpriv)
 
 	lockdep_assert_held_once(&dev->master_mutex);
 
-	WARN_ON(fpriv->is_master);
 	old_master = fpriv->master;
 	fpriv->master = drm_master_create(dev);
 	if (!fpriv->master) {
@@ -162,7 +161,6 @@ out_err:
 	/* drop references and restore old master on failure */
 	drm_master_put(&fpriv->master);
 	fpriv->master = old_master;
-	fpriv->is_master = 0;
 
 	return ret;
 }
@@ -244,10 +242,9 @@ int drm_master_open(struct drm_file *file_priv)
 void drm_master_release(struct drm_file *file_priv)
 {
 	struct drm_device *dev = file_priv->minor->dev;
-	struct drm_master *master;
+	struct drm_master *master = file_priv->master;
 
 	mutex_lock(&dev->master_mutex);
-	master = file_priv->master;
 	if (file_priv->magic)
 		idr_remove(&file_priv->master->magic_map, file_priv->magic);
 

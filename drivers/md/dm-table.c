@@ -384,6 +384,29 @@ dev_t dm_get_dev_t(const char *path)
 		bdput(bdev);
 	}
 
+	if (!dev) {
+		unsigned int wait_time_ms = 0;
+
+		DMERR("%s: retry %s\n", __func__, path);
+		while (driver_probe_done() != 0 || dev == 0) {
+			msleep(100);
+			wait_time_ms += 100;
+			if (wait_time_ms > DM_WAIT_DEV_MAX_TIME) {
+				DMERR("%s: retry timeout(%dms)\n", __func__,
+						DM_WAIT_DEV_MAX_TIME);
+				DMERR("no dev found for %s", path);
+				return 0;
+			}
+			bdev = lookup_bdev(path);
+			if (IS_ERR(bdev))
+				dev = name_to_dev_t(path);
+			else {
+				dev = bdev->bd_dev;
+				bdput(bdev);
+			}
+		}
+	}
+
 	return dev;
 }
 EXPORT_SYMBOL_GPL(dm_get_dev_t);
@@ -397,23 +420,14 @@ int dm_get_device(struct dm_target *ti, const char *path, fmode_t mode,
 {
 	int r;
 	dev_t dev;
-	unsigned int major, minor;
-	char dummy;
 	struct dm_dev_internal *dd;
 	struct dm_table *t = ti->table;
 
 	BUG_ON(!t);
 
-	if (sscanf(path, "%u:%u%c", &major, &minor, &dummy) == 2) {
-		/* Extract the major/minor numbers */
-		dev = MKDEV(major, minor);
-		if (MAJOR(dev) != major || MINOR(dev) != minor)
-			return -EOVERFLOW;
-	} else {
-		dev = dm_get_dev_t(path);
-		if (!dev)
-			return -ENODEV;
-	}
+	dev = dm_get_dev_t(path);
+	if (!dev)
+		return -ENODEV;
 
 	dd = find_device(&t->devices, dev);
 	if (!dd) {
@@ -520,14 +534,14 @@ static int adjoin(struct dm_table *table, struct dm_target *ti)
  * On the other hand, dm-switch needs to process bulk data using messages and
  * excessive use of GFP_NOIO could cause trouble.
  */
-static char **realloc_argv(unsigned *size, char **old_argv)
+static char **realloc_argv(unsigned *array_size, char **old_argv)
 {
 	char **argv;
 	unsigned new_size;
 	gfp_t gfp;
 
-	if (*size) {
-		new_size = *size * 2;
+	if (*array_size) {
+		new_size = *array_size * 2;
 		gfp = GFP_KERNEL;
 	} else {
 		new_size = 8;
@@ -535,8 +549,8 @@ static char **realloc_argv(unsigned *size, char **old_argv)
 	}
 	argv = kmalloc(new_size * sizeof(*argv), gfp);
 	if (argv) {
-		memcpy(argv, old_argv, *size * sizeof(*argv));
-		*size = new_size;
+		memcpy(argv, old_argv, *array_size * sizeof(*argv));
+		*array_size = new_size;
 	}
 
 	kfree(old_argv);
@@ -849,12 +863,12 @@ void dm_table_set_type(struct dm_table *t, unsigned type)
 }
 EXPORT_SYMBOL_GPL(dm_table_set_type);
 
-static int device_not_dax_capable(struct dm_target *ti, struct dm_dev *dev,
-				  sector_t start, sector_t len, void *data)
+static int device_supports_dax(struct dm_target *ti, struct dm_dev *dev,
+			       sector_t start, sector_t len, void *data)
 {
 	struct request_queue *q = bdev_get_queue(dev->bdev);
 
-	return q && !blk_queue_dax(q);
+	return q && blk_queue_dax(q);
 }
 
 static bool dm_table_supports_dax(struct dm_table *t)
@@ -870,7 +884,7 @@ static bool dm_table_supports_dax(struct dm_table *t)
 			return false;
 
 		if (!ti->type->iterate_devices ||
-		    ti->type->iterate_devices(ti, device_not_dax_capable, NULL))
+		    !ti->type->iterate_devices(ti, device_supports_dax, NULL))
 			return false;
 	}
 
@@ -1260,6 +1274,12 @@ void dm_table_event_callback(struct dm_table *t,
 
 void dm_table_event(struct dm_table *t)
 {
+	/*
+	 * You can no longer call dm_table_event() from interrupt
+	 * context, use a bottom half instead.
+	 */
+	BUG_ON(in_interrupt());
+
 	mutex_lock(&_event_lock);
 	if (t->event_fn)
 		t->event_fn(t->event_context);
@@ -1267,7 +1287,7 @@ void dm_table_event(struct dm_table *t)
 }
 EXPORT_SYMBOL(dm_table_event);
 
-inline sector_t dm_table_get_size(struct dm_table *t)
+sector_t dm_table_get_size(struct dm_table *t)
 {
 	return t->num_targets ? (t->highs[t->num_targets - 1] + 1) : 0;
 }
@@ -1292,9 +1312,6 @@ struct dm_target *dm_table_find_target(struct dm_table *t, sector_t sector)
 	unsigned int l, n = 0, k = 0;
 	sector_t *node;
 
-	if (unlikely(sector >= dm_table_get_size(t)))
-		return &t->targets[t->num_targets];
-
 	for (l = 0; l < t->depth; l++) {
 		n = get_child(n, k);
 		node = get_node(t, l, n);
@@ -1305,46 +1322,6 @@ struct dm_target *dm_table_find_target(struct dm_table *t, sector_t sector)
 	}
 
 	return &t->targets[(KEYS_PER_NODE * n) + k];
-}
-
-/*
- * type->iterate_devices() should be called when the sanity check needs to
- * iterate and check all underlying data devices. iterate_devices() will
- * iterate all underlying data devices until it encounters a non-zero return
- * code, returned by whether the input iterate_devices_callout_fn, or
- * iterate_devices() itself internally.
- *
- * For some target type (e.g. dm-stripe), one call of iterate_devices() may
- * iterate multiple underlying devices internally, in which case a non-zero
- * return code returned by iterate_devices_callout_fn will stop the iteration
- * in advance.
- *
- * Cases requiring _any_ underlying device supporting some kind of attribute,
- * should use the iteration structure like dm_table_any_dev_attr(), or call
- * it directly. @func should handle semantics of positive examples, e.g.
- * capable of something.
- *
- * Cases requiring _all_ underlying devices supporting some kind of attribute,
- * should use the iteration structure like dm_table_supports_nowait() or
- * dm_table_supports_discards(). Or introduce dm_table_all_devs_attr() that
- * uses an @anti_func that handle semantics of counter examples, e.g. not
- * capable of something. So: return !dm_table_any_dev_attr(t, anti_func);
- */
-static bool dm_table_any_dev_attr(struct dm_table *t,
-				  iterate_devices_callout_fn func)
-{
-	struct dm_target *ti;
-	unsigned int i;
-
-	for (i = 0; i < dm_table_get_num_targets(t); i++) {
-		ti = dm_table_get_target(t, i);
-
-		if (ti->type->iterate_devices &&
-		    ti->type->iterate_devices(ti, func, NULL))
-			return true;
-        }
-
-	return false;
 }
 
 static int count_device(struct dm_target *ti, struct dm_dev *dev,
@@ -1517,12 +1494,12 @@ static bool dm_table_discard_zeroes_data(struct dm_table *t)
 	return true;
 }
 
-static int device_is_rotational(struct dm_target *ti, struct dm_dev *dev,
-				sector_t start, sector_t len, void *data)
+static int device_is_nonrot(struct dm_target *ti, struct dm_dev *dev,
+			    sector_t start, sector_t len, void *data)
 {
 	struct request_queue *q = bdev_get_queue(dev->bdev);
 
-	return q && !blk_queue_nonrot(q);
+	return q && blk_queue_nonrot(q);
 }
 
 static int device_is_not_random(struct dm_target *ti, struct dm_dev *dev,
@@ -1533,12 +1510,29 @@ static int device_is_not_random(struct dm_target *ti, struct dm_dev *dev,
 	return q && !blk_queue_add_random(q);
 }
 
-static int queue_no_sg_merge(struct dm_target *ti, struct dm_dev *dev,
-			     sector_t start, sector_t len, void *data)
+static int queue_supports_sg_merge(struct dm_target *ti, struct dm_dev *dev,
+				   sector_t start, sector_t len, void *data)
 {
 	struct request_queue *q = bdev_get_queue(dev->bdev);
 
-	return q && test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags);
+	return q && !test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags);
+}
+
+static bool dm_table_all_devices_attribute(struct dm_table *t,
+					   iterate_devices_callout_fn func)
+{
+	struct dm_target *ti;
+	unsigned i = 0;
+
+	while (i < dm_table_get_num_targets(t)) {
+		ti = dm_table_get_target(t, i++);
+
+		if (!ti->type->iterate_devices ||
+		    !ti->type->iterate_devices(ti, func, NULL))
+			return false;
+	}
+
+	return true;
 }
 
 static int device_not_write_same_capable(struct dm_target *ti, struct dm_dev *dev,
@@ -1631,18 +1625,18 @@ void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
 		q->limits.discard_zeroes_data = 0;
 
 	/* Ensure that all underlying devices are non-rotational. */
-	if (dm_table_any_dev_attr(t, device_is_rotational))
-		queue_flag_clear_unlocked(QUEUE_FLAG_NONROT, q);
-	else
+	if (dm_table_all_devices_attribute(t, device_is_nonrot))
 		queue_flag_set_unlocked(QUEUE_FLAG_NONROT, q);
+	else
+		queue_flag_clear_unlocked(QUEUE_FLAG_NONROT, q);
 
 	if (!dm_table_supports_write_same(t))
 		q->limits.max_write_same_sectors = 0;
 
-	if (dm_table_any_dev_attr(t, queue_no_sg_merge))
-		queue_flag_set_unlocked(QUEUE_FLAG_NO_SG_MERGE, q);
-	else
+	if (dm_table_all_devices_attribute(t, queue_supports_sg_merge))
 		queue_flag_clear_unlocked(QUEUE_FLAG_NO_SG_MERGE, q);
+	else
+		queue_flag_set_unlocked(QUEUE_FLAG_NO_SG_MERGE, q);
 
 	dm_table_verify_integrity(t);
 
@@ -1652,7 +1646,7 @@ void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
 	 * Clear QUEUE_FLAG_ADD_RANDOM if any underlying device does not
 	 * have it set.
 	 */
-	if (blk_queue_add_random(q) && dm_table_any_dev_attr(t, device_is_not_random))
+	if (blk_queue_add_random(q) && dm_table_all_devices_attribute(t, device_is_not_random))
 		queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, q);
 
 	/*
@@ -1785,7 +1779,7 @@ int dm_table_any_congested(struct dm_table *t, int bdi_bits)
 		char b[BDEVNAME_SIZE];
 
 		if (likely(q))
-			r |= bdi_congested(&q->backing_dev_info, bdi_bits);
+			r |= bdi_congested(q->backing_dev_info, bdi_bits);
 		else
 			DMWARN_LIMIT("%s: any_congested: nonexistent device %s",
 				     dm_device_name(t->md),

@@ -181,7 +181,7 @@ static int serial_link_irq_chain(struct uart_8250_port *up)
 	struct hlist_head *h;
 	struct hlist_node *n;
 	struct irq_info *i;
-	int ret;
+	int ret, irq_flags = up->port.flags & UPF_SHARE_IRQ ? IRQF_SHARED : 0;
 
 	mutex_lock(&hash_mutex);
 
@@ -216,8 +216,9 @@ static int serial_link_irq_chain(struct uart_8250_port *up)
 		INIT_LIST_HEAD(&up->list);
 		i->head = &up->list;
 		spin_unlock_irq(&i->lock);
+		irq_flags |= up->port.irqflags;
 		ret = request_irq(up->port.irq, serial8250_interrupt,
-				  up->port.irqflags, "serial", i);
+				  irq_flags, "serial", i);
 		if (ret < 0)
 			serial_do_unlink(i, up);
 	}
@@ -529,7 +530,6 @@ static void __init serial8250_isa_init_ports(void)
 		 */
 		up->mcr_mask = ~ALPHA_KLUDGE_MCR;
 		up->mcr_force = ALPHA_KLUDGE_MCR;
-		serial8250_set_defaults(up);
 	}
 
 	/* chain base port ops to support Remote Supervisor Adapter */
@@ -553,6 +553,7 @@ static void __init serial8250_isa_init_ports(void)
 		port->membase  = old_serial_port[i].iomem_base;
 		port->iotype   = old_serial_port[i].io_type;
 		port->regshift = old_serial_port[i].iomem_reg_shift;
+		serial8250_set_defaults(up);
 
 		port->irqflags |= irqflag;
 		if (serial8250_isa_config != NULL)
@@ -704,6 +705,19 @@ static struct uart_driver serial8250_reg = {
 	.cons			= SERIAL8250_CONSOLE,
 };
 
+#ifdef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Add for chargerid */
+extern bool boot_with_console(void);
+static struct uart_driver serial8250_reg_no_console = {
+	.owner			= THIS_MODULE,
+	.driver_name		= "serial",
+	.dev_name		= "ttyS",
+	.major			= TTY_MAJOR,
+	.minor			= 64,
+	.cons			= NULL,
+};
+#endif /*VENDOR_EDIT*/
+
 /*
  * early_serial_setup - early registration for 8250 ports
  *
@@ -765,7 +779,16 @@ void serial8250_suspend_port(int line)
 			up->canary = canary;
 	}
 
+#ifndef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Modify for chargerid */
 	uart_suspend_port(&serial8250_reg, port);
+#else
+	if (boot_with_console() == true) {
+		uart_suspend_port(&serial8250_reg, port);
+	} else {
+		uart_suspend_port(&serial8250_reg_no_console, port);
+	}
+#endif /*VENDOR_EDIT*/
 }
 EXPORT_SYMBOL(serial8250_suspend_port);
 
@@ -791,7 +814,17 @@ void serial8250_resume_port(int line)
 		serial_port_out(port, UART_LCR, 0);
 		port->uartclk = 921600*16;
 	}
+
+#ifndef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Modify for chargerid */
 	uart_resume_port(&serial8250_reg, port);
+#else
+	if (boot_with_console() == true) {
+		uart_resume_port(&serial8250_reg, port);
+	} else {
+		uart_resume_port(&serial8250_reg_no_console, port);
+	}
+#endif /*VENDOR_EDIT*/
 }
 EXPORT_SYMBOL(serial8250_resume_port);
 
@@ -868,7 +901,18 @@ static int serial8250_suspend(struct platform_device *dev, pm_message_t state)
 		struct uart_8250_port *up = &serial8250_ports[i];
 
 		if (up->port.type != PORT_UNKNOWN && up->port.dev == &dev->dev)
+#ifndef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Modify for chargerid */
 			uart_suspend_port(&serial8250_reg, &up->port);
+#else
+		{
+			if (boot_with_console() == true) {
+				uart_suspend_port(&serial8250_reg, &up->port);
+			} else {
+				uart_suspend_port(&serial8250_reg_no_console, &up->port);
+			}
+		}
+#endif /*VENDOR_EDIT*/
 	}
 
 	return 0;
@@ -973,8 +1017,19 @@ int serial8250_register_8250_port(struct uart_8250_port *up)
 
 	uart = serial8250_find_match_or_unused(&up->port);
 	if (uart && uart->port.type != PORT_8250_CIR) {
+#ifndef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Modify for chargerid */
 		if (uart->port.dev)
 			uart_remove_one_port(&serial8250_reg, &uart->port);
+#else
+		if (boot_with_console() == true) {
+			if (uart->port.dev)
+				uart_remove_one_port(&serial8250_reg, &uart->port);
+		} else {
+			if (uart->port.dev)
+				uart_remove_one_port(&serial8250_reg_no_console, &uart->port);
+		}
+#endif /*VENDOR_EDIT*/
 
 		uart->port.iobase       = up->port.iobase;
 		uart->port.membase      = up->port.membase;
@@ -1044,12 +1099,21 @@ int serial8250_register_8250_port(struct uart_8250_port *up)
 				serial8250_isa_config(0, &uart->port,
 						&uart->capabilities);
 
+#ifndef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Modify for chargerid */
 			ret = uart_add_one_port(&serial8250_reg,
 						&uart->port);
-			if (ret)
-				goto err;
-
-			ret = uart->port.line;
+#else
+			if (boot_with_console() == true) {
+				ret = uart_add_one_port(&serial8250_reg,
+						&uart->port);
+			} else {
+				ret = uart_add_one_port(&serial8250_reg_no_console,
+						&uart->port);
+			}
+#endif /*VENDOR_EDIT*/
+			if (ret == 0)
+				ret = uart->port.line;
 		} else {
 			dev_info(uart->port.dev,
 				"skipping CIR port at 0x%lx / 0x%llx, IRQ %d\n",
@@ -1062,11 +1126,6 @@ int serial8250_register_8250_port(struct uart_8250_port *up)
 	}
 	mutex_unlock(&serial_mutex);
 
-	return ret;
-
-err:
-	uart->port.dev = NULL;
-	mutex_unlock(&serial_mutex);
 	return ret;
 }
 EXPORT_SYMBOL(serial8250_register_8250_port);
@@ -1092,7 +1151,16 @@ void serial8250_unregister_port(int line)
 		spin_unlock_irqrestore(&uart->port.lock, flags);
 	}
 
+#ifndef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Modify for chargerid */
 	uart_remove_one_port(&serial8250_reg, &uart->port);
+#else
+	if (boot_with_console() == true) {
+		uart_remove_one_port(&serial8250_reg, &uart->port);
+	} else {
+		uart_remove_one_port(&serial8250_reg_no_console, &uart->port);
+	}
+#endif /*VENDOR_EDIT*/
 	if (serial8250_isa_devs) {
 		uart->port.flags &= ~UPF_BOOT_AUTOCONF;
 		if (skip_txen_test)
@@ -1100,7 +1168,16 @@ void serial8250_unregister_port(int line)
 		uart->port.type = PORT_UNKNOWN;
 		uart->port.dev = &serial8250_isa_devs->dev;
 		uart->capabilities = 0;
+#ifndef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Modify for chargerid */
 		uart_add_one_port(&serial8250_reg, &uart->port);
+#else
+		if (boot_with_console() == true) {
+			uart_add_one_port(&serial8250_reg, &uart->port);
+		} else {
+			uart_add_one_port(&serial8250_reg_no_console, &uart->port);
+		}
+#endif /*VENDOR_EDIT*/
 	} else {
 		uart->port.dev = NULL;
 	}
@@ -1121,10 +1198,30 @@ static int __init serial8250_init(void)
 		nr_uarts, share_irqs ? "en" : "dis");
 
 #ifdef CONFIG_SPARC
+#ifndef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Modify for chargerid */
 	ret = sunserial_register_minors(&serial8250_reg, UART_NR);
 #else
+	if (boot_with_console() == true) {
+		ret = sunserial_register_minors(&serial8250_reg, UART_NR);
+	} else {
+		ret = sunserial_register_minors(&serial8250_reg_no_console, UART_NR);
+	}
+#endif /*VENDOR_EDIT*/
+#else
+#ifndef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Modify for chargerid */
 	serial8250_reg.nr = UART_NR;
 	ret = uart_register_driver(&serial8250_reg);
+#else
+	if (boot_with_console() == true) {
+		serial8250_reg.nr = UART_NR;
+		ret = uart_register_driver(&serial8250_reg);
+	} else {
+		serial8250_reg_no_console.nr = UART_NR;
+		ret = uart_register_driver(&serial8250_reg_no_console);
+	}
+#endif /*VENDOR_EDIT*/
 #endif
 	if (ret)
 		goto out;
@@ -1144,7 +1241,16 @@ static int __init serial8250_init(void)
 	if (ret)
 		goto put_dev;
 
+#ifndef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Modify for chargerid */
 	serial8250_register_ports(&serial8250_reg, &serial8250_isa_devs->dev);
+#else
+	if (boot_with_console() == true) {
+		serial8250_register_ports(&serial8250_reg, &serial8250_isa_devs->dev);
+	} else {
+		serial8250_register_ports(&serial8250_reg_no_console, &serial8250_isa_devs->dev);
+	}
+#endif /*VENDOR_EDIT*/
 
 	ret = platform_driver_register(&serial8250_isa_driver);
 	if (ret == 0)
@@ -1157,9 +1263,27 @@ unreg_pnp:
 	serial8250_pnp_exit();
 unreg_uart_drv:
 #ifdef CONFIG_SPARC
+#ifndef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Modify for chargerid */
 	sunserial_unregister_minors(&serial8250_reg, UART_NR);
 #else
+	if (boot_with_console() == true) {
+		sunserial_unregister_minors(&serial8250_reg, UART_NR);
+	} else {
+		sunserial_unregister_minors(&serial8250_reg_no_console, UART_NR);
+	}
+#endif /*VENDOR_EDIT*/
+#else
+#ifndef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Modify for chargerid */
 	uart_unregister_driver(&serial8250_reg);
+#else
+	if (boot_with_console() == true) {
+		uart_unregister_driver(&serial8250_reg);
+	} else {
+		uart_unregister_driver(&serial8250_reg_no_console);
+	}
+#endif /*VENDOR_EDIT*/
 #endif
 out:
 	return ret;
@@ -1182,9 +1306,27 @@ static void __exit serial8250_exit(void)
 	serial8250_pnp_exit();
 
 #ifdef CONFIG_SPARC
+#ifndef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Modify for chargerid */
 	sunserial_unregister_minors(&serial8250_reg, UART_NR);
 #else
+	if (boot_with_console() == true) {
+		sunserial_unregister_minors(&serial8250_reg, UART_NR);
+	} else {
+		sunserial_unregister_minors(&serial8250_reg_no_console, UART_NR);
+	}
+#endif /*VENDOR_EDIT*/
+#else
+#ifndef VENDOR_EDIT
+/* Jianchao.Shi@PSW.BSP.CHG.Basic, 2018/10/11, sjc Modify for chargerid */
 	uart_unregister_driver(&serial8250_reg);
+#else
+	if (boot_with_console() == true) {
+		uart_unregister_driver(&serial8250_reg);
+	} else {
+		uart_unregister_driver(&serial8250_reg_no_console);
+	}
+#endif /*VENDOR_EDIT*/
 #endif
 }
 

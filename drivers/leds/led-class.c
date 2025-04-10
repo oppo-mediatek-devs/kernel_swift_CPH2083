@@ -24,6 +24,14 @@
 
 static struct class *leds_class;
 
+#ifdef VENDOR_EDIT
+/*
+* Ling.Guo@PSW.MM.Display.LCD.Stability, 2019/01/28,
+* add for oppo brightness and max_brightness node
+*/
+extern unsigned long oppo_display_brightness;
+#endif
+
 static ssize_t brightness_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
@@ -60,6 +68,15 @@ static ssize_t brightness_store(struct device *dev,
 	ret = size;
 unlock:
 	mutex_unlock(&led_cdev->led_access);
+
+	#ifdef VENDOR_EDIT
+	/*
+	* Ling.Guo@PSW.MM.Display.LCD.Stability, 2019/01/28,
+	* add for oppo brightness and max_brightness node
+	*/
+//	oppo_display_brightness = state;
+	#endif
+
 	return ret;
 }
 static DEVICE_ATTR_RW(brightness);
@@ -110,7 +127,6 @@ void led_classdev_suspend(struct led_classdev *led_cdev)
 {
 	led_cdev->flags |= LED_SUSPENDED;
 	led_set_brightness_nopm(led_cdev, 0);
-	flush_work(&led_cdev->set_brightness_work);
 }
 EXPORT_SYMBOL_GPL(led_classdev_suspend);
 

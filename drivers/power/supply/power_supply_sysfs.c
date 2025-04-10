@@ -45,14 +45,20 @@ static ssize_t power_supply_show_property(struct device *dev,
 					  char *buf) {
 	static char *type_text[] = {
 		"Unknown", "Battery", "UPS", "Mains", "USB",
-		"USB_DCP", "USB_CDP", "USB_ACA", "USB_C",
+		"USB_DCP", "USB_CDP", "USB_ACA", "Wireless", "USB_C",
 		"USB_PD", "USB_PD_DRP"
 	};
 	static char *status_text[] = {
-		"Unknown", "Charging", "Discharging", "Not charging", "Full"
+		"Unknown", "Charging", "Discharging", "Not charging", "Full",
+		"Cmd discharging"
 	};
 	static char *charge_type[] = {
+#ifdef ODM_HQ_EDIT
+/*duanhanxing@ODM.HQ.BSP.CHG.Basic 2018.12.10 modify charger type*/
+		"Not charging", "Pre charging", "Fast", "Full"
+#else /*ODM_HQ_EDIT*/
 		"Unknown", "N/A", "Trickle", "Fast"
+#endif /*ODM_HQ_EDIT*/
 	};
 	static char *health_text[] = {
 		"Unknown", "Good", "Overheat", "Dead", "Over voltage",
@@ -84,8 +90,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 				dev_dbg(dev, "driver has no data for `%s' property\n",
 					attr->attr.name);
 			else if (ret != -ENODEV && ret != -EAGAIN)
-				dev_err_ratelimited(dev,
-					"driver failed to report `%s' property: %zd\n",
+				dev_err(dev, "driver failed to report `%s' property: %zd\n",
 					attr->attr.name, ret);
 			return ret;
 		}
@@ -105,6 +110,11 @@ static ssize_t power_supply_show_property(struct device *dev,
 		return sprintf(buf, "%s\n", type_text[value.intval]);
 	else if (off == POWER_SUPPLY_PROP_SCOPE)
 		return sprintf(buf, "%s\n", scope_text[value.intval]);
+/* WT000695@ODM_WT.BSP.Charger.kernel.20191218, Add Battery MMI hardware info in KERNEL */
+#ifdef ODM_WT_EDIT
+	else if (off == POWER_SUPPLY_PROP_REAL_TYPE)
+		return sprintf(buf, "%s\n", type_text[value.intval]);
+#endif
 	else if (off >= POWER_SUPPLY_PROP_MODEL_NAME)
 		return sprintf(buf, "%s\n", value.strval);
 
@@ -141,6 +151,8 @@ static ssize_t power_supply_store_property(struct device *dev,
 static struct device_attribute power_supply_attrs[] = {
 	/* Properties of type `int' */
 	POWER_SUPPLY_ATTR(status),
+	POWER_SUPPLY_ATTR(otg_switch),
+	POWER_SUPPLY_ATTR(otg_online),
 	POWER_SUPPLY_ATTR(charge_type),
 	POWER_SUPPLY_ATTR(health),
 	POWER_SUPPLY_ATTR(present),
@@ -206,6 +218,32 @@ static struct device_attribute power_supply_attrs[] = {
 	POWER_SUPPLY_ATTR(usb_hc),
 	POWER_SUPPLY_ATTR(usb_otg),
 	POWER_SUPPLY_ATTR(charge_enabled),
+#ifdef ODM_HQ_EDIT
+/*Hanxing.Duan@ODM.HQ.BSP.CHG.Basic 2019.10.21 add bq check_charging_enable function*/
+	POWER_SUPPLY_ATTR(batt_id),
+	POWER_SUPPLY_ATTR(batt_rm),
+	POWER_SUPPLY_ATTR(batt_cc),
+	POWER_SUPPLY_ATTR(batt_fcc),
+	POWER_SUPPLY_ATTR(authenticate),
+	POWER_SUPPLY_ATTR(notify_code),
+	POWER_SUPPLY_ATTR(mmi_charging_enable),
+	POWER_SUPPLY_ATTR(stop_charging_enable),
+	POWER_SUPPLY_ATTR(charge_timeout),
+#endif /*ODM_HQ_EDIT*/
+/* WT000695@ODM_WT.BSP.Charger.kernel.20191218, Add Battery MMI hardware info in KERNEL */
+#ifdef ODM_WT_EDIT
+	POWER_SUPPLY_ATTR(resistance_id),
+	POWER_SUPPLY_ATTR(real_type),
+#endif
+#ifdef CONFIG_OPPO_CHIP_SOC_NODE
+	POWER_SUPPLY_ATTR(chip_soc),
+#endif /*CONFIG_OPPO_CHIP_SOC_NODE*/
+#ifdef CONFIG_OPPO_CALL_MODE_SUPPORT
+	POWER_SUPPLY_ATTR(call_mode),
+#endif /* CONFIG_OPPO_CALL_MODE_SUPPORT */
+#ifdef CONFIG_OPPO_SHIP_MODE_SUPPORT
+	POWER_SUPPLY_ATTR(ship_mode),
+#endif /*CONFIG_OPPO_SHIP_MODE_SUPPORT*/
 	/* Local extensions of type int64_t */
 	POWER_SUPPLY_ATTR(charge_counter_ext),
 	/* Properties of type `const char *' */
@@ -288,10 +326,14 @@ int power_supply_uevent(struct device *dev, struct kobj_uevent_env *env)
 	char *prop_buf;
 	char *attrname;
 
+	dev_dbg(dev, "uevent\n");
+
 	if (!psy || !psy->desc) {
 		dev_dbg(dev, "No power supply yet\n");
 		return ret;
 	}
+
+	dev_dbg(dev, "POWER_SUPPLY_NAME=%s\n", psy->desc->name);
 
 	ret = add_uevent_var(env, "POWER_SUPPLY_NAME=%s", psy->desc->name);
 	if (ret)
@@ -327,6 +369,8 @@ int power_supply_uevent(struct device *dev, struct kobj_uevent_env *env)
 			ret = -ENOMEM;
 			goto out;
 		}
+
+		dev_dbg(dev, "prop %s=%s\n", attrname, prop_buf);
 
 		ret = add_uevent_var(env, "POWER_SUPPLY_%s=%s", attrname, prop_buf);
 		kfree(attrname);

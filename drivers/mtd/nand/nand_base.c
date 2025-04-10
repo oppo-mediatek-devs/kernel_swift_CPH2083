@@ -4868,6 +4868,9 @@ int nand_scan_tail(struct mtd_info *mtd)
 	 */
 	if (!mtd->bitflip_threshold)
 		mtd->bitflip_threshold = DIV_ROUND_UP(mtd->ecc_strength * 3, 4);
+	pr_info("ecc strength ds required: %d per %d, error thres: %d per %d\n",
+		chip->ecc_strength_ds, chip->ecc_step_ds, mtd->bitflip_threshold,
+		chip->ecc.size);
 
 	/* Check, if we should skip the bad block table scan */
 	if (chip->options & NAND_SKIP_BBTSCAN)
@@ -4941,12 +4944,12 @@ EXPORT_SYMBOL_GPL(nand_cleanup);
 /**
  * nand_release - [NAND Interface] Unregister the MTD device and free resources
  *		  held by the NAND device
- * @chip: NAND chip object
+ * @mtd: MTD device structure
  */
-void nand_release(struct nand_chip *chip)
+void nand_release(struct mtd_info *mtd)
 {
-	mtd_device_unregister(nand_to_mtd(chip));
-	nand_cleanup(chip);
+	mtd_device_unregister(mtd);
+	nand_cleanup(mtd_to_nand(mtd));
 }
 EXPORT_SYMBOL_GPL(nand_release);
 

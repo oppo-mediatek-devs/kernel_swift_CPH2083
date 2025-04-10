@@ -34,11 +34,6 @@ struct f_eem {
 	u8				ctrl_id;
 };
 
-struct in_context {
-	struct sk_buff	*skb;
-	struct usb_ep	*ep;
-};
-
 static inline struct f_eem *func_to_eem(struct usb_function *f)
 {
 	return container_of(f, struct f_eem, port.func);
@@ -314,7 +309,7 @@ static int eem_bind(struct usb_configuration *c, struct usb_function *f)
 	eem_ss_out_desc.bEndpointAddress = eem_fs_out_desc.bEndpointAddress;
 
 	status = usb_assign_descriptors(f, eem_fs_function, eem_hs_function,
-			eem_ss_function, eem_ss_function);
+			eem_ss_function, NULL);
 	if (status)
 		goto fail;
 
@@ -332,12 +327,9 @@ fail:
 
 static void eem_cmd_complete(struct usb_ep *ep, struct usb_request *req)
 {
-	struct in_context *ctx = req->context;
+	struct sk_buff *skb = (struct sk_buff *)req->context;
 
-	dev_kfree_skb_any(ctx->skb);
-	kfree(req->buf);
-	usb_ep_free_request(ctx->ep, req);
-	kfree(ctx);
+	dev_kfree_skb_any(skb);
 }
 
 /*
@@ -425,9 +417,7 @@ static int eem_unwrap(struct gether *port,
 		 * b15:		bmType (0 == data, 1 == command)
 		 */
 		if (header & BIT(15)) {
-			struct usb_request	*req;
-			struct in_context	*ctx;
-			struct usb_ep		*ep;
+			struct usb_request	*req = cdev->req;
 			u16			bmEEMCmd;
 
 			/* EEM command packet format:
@@ -456,36 +446,11 @@ static int eem_unwrap(struct gether *port,
 				skb_trim(skb2, len);
 				put_unaligned_le16(BIT(15) | BIT(11) | len,
 							skb_push(skb2, 2));
-
-				ep = port->in_ep;
-				req = usb_ep_alloc_request(ep, GFP_ATOMIC);
-				if (!req) {
-					dev_kfree_skb_any(skb2);
-					goto next;
-				}
-
-				req->buf = kmalloc(skb2->len, GFP_KERNEL);
-				if (!req->buf) {
-					usb_ep_free_request(ep, req);
-					dev_kfree_skb_any(skb2);
-					goto next;
-				}
-
-				ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-				if (!ctx) {
-					kfree(req->buf);
-					usb_ep_free_request(ep, req);
-					dev_kfree_skb_any(skb2);
-					goto next;
-				}
-				ctx->skb = skb2;
-				ctx->ep = ep;
-
 				skb_copy_bits(skb2, 0, req->buf, skb2->len);
 				req->length = skb2->len;
 				req->complete = eem_cmd_complete;
 				req->zero = 1;
-				req->context = ctx;
+				req->context = skb2;
 				if (usb_ep_queue(port->in_ep, req, GFP_ATOMIC))
 					DBG(cdev, "echo response queue fail\n");
 				break;
@@ -537,7 +502,7 @@ static int eem_unwrap(struct gether *port,
 			skb2 = skb_clone(skb, GFP_ATOMIC);
 			if (unlikely(!skb2)) {
 				DBG(cdev, "unable to unframe EEM packet\n");
-				goto next;
+				continue;
 			}
 			skb_trim(skb2, len - ETH_FCS_LEN);
 
@@ -548,7 +513,7 @@ static int eem_unwrap(struct gether *port,
 			if (unlikely(!skb3)) {
 				DBG(cdev, "unable to realign EEM packet\n");
 				dev_kfree_skb_any(skb2);
-				goto next;
+				continue;
 			}
 			dev_kfree_skb_any(skb2);
 			skb_queue_tail(list, skb3);
@@ -648,6 +613,68 @@ static void eem_unbind(struct usb_configuration *c, struct usb_function *f)
 	DBG(c->cdev, "eem unbind\n");
 
 	usb_free_all_descriptors(f);
+}
+
+static void
+eem_old_unbind(struct usb_configuration *c, struct usb_function *f)
+{
+	struct f_eem	*eem = func_to_eem(f);
+
+	DBG(c->cdev, "eem unbind\n");
+
+	usb_free_all_descriptors(f);
+	kfree(eem);
+}
+/**
+ * eem_bind_config - add CDC Ethernet (EEM) network link to a configuration
+ * @c: the configuration to support the network link
+ * Context: single threaded during gadget setup
+ *
+ * Returns zero on success, else negative errno.
+ *
+ * Caller must have called @gether_setup().  Caller is also responsible
+ * for calling @gether_cleanup() before module unload.
+ */
+int eem_bind_config(struct usb_configuration *c, struct eth_dev *dev)
+{
+	struct f_eem	*eem;
+	int		status;
+
+	/* maybe allocate device-global string IDs */
+	if (eem_string_defs[0].id == 0) {
+
+		/* control interface label */
+		status = usb_string_id(c->cdev);
+		if (status < 0)
+			return status;
+		eem_string_defs[0].id = status;
+		eem_intf.iInterface = status;
+	}
+
+	/* allocate and initialize one new instance */
+	eem = kzalloc(sizeof(*eem), GFP_KERNEL);
+	if (!eem)
+		return -ENOMEM;
+
+	eem->port.ioport = dev;
+	eem->port.cdc_filter = DEFAULT_FILTER;
+
+	eem->port.func.name = "cdc_eem";
+	eem->port.func.strings = eem_strings;
+	/* descriptors are per-instance copies */
+	eem->port.func.bind = eem_bind;
+	eem->port.func.unbind = eem_old_unbind;
+	eem->port.func.set_alt = eem_set_alt;
+	eem->port.func.setup = eem_setup;
+	eem->port.func.disable = eem_disable;
+	eem->port.wrap = eem_wrap;
+	eem->port.unwrap = eem_unwrap;
+	eem->port.header_len = EEM_HLEN;
+
+	status = usb_add_function(c, &eem->port.func);
+	if (status)
+		kfree(eem);
+	return status;
 }
 
 static struct usb_function *eem_alloc(struct usb_function_instance *fi)

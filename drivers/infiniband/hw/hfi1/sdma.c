@@ -410,7 +410,10 @@ static void sdma_flush(struct sdma_engine *sde)
 	sdma_flush_descq(sde);
 	spin_lock_irqsave(&sde->flushlist_lock, flags);
 	/* copy flush list */
-	list_splice_init(&sde->flushlist, &flushlist);
+	list_for_each_entry_safe(txp, txp_next, &sde->flushlist, list) {
+		list_del_init(&txp->list);
+		list_add_tail(&txp->list, &flushlist);
+	}
 	spin_unlock_irqrestore(&sde->flushlist_lock, flags);
 	/* flush from flush list */
 	list_for_each_entry_safe(txp, txp_next, &flushlist, list)
@@ -2403,7 +2406,7 @@ unlock_noconn:
 		wait->tx_count++;
 		wait->count += tx->num_desc;
 	}
-	queue_work_on(sde->cpu, system_highpri_wq, &sde->flush_worker);
+	schedule_work(&sde->flush_worker);
 	ret = -ECOMM;
 	goto unlock;
 nodesc:
@@ -2501,7 +2504,7 @@ unlock_noconn:
 		}
 	}
 	spin_unlock(&sde->flushlist_lock);
-	queue_work_on(sde->cpu, system_highpri_wq, &sde->flush_worker);
+	schedule_work(&sde->flush_worker);
 	ret = -ECOMM;
 	goto update_tail;
 nodesc:
@@ -3028,7 +3031,6 @@ static void __sdma_process_event(struct sdma_engine *sde,
 static int _extend_sdma_tx_descs(struct hfi1_devdata *dd, struct sdma_txreq *tx)
 {
 	int i;
-	struct sdma_desc *descp;
 
 	/* Handle last descriptor */
 	if (unlikely((tx->num_desc == (MAX_DESC - 1)))) {
@@ -3049,10 +3051,12 @@ static int _extend_sdma_tx_descs(struct hfi1_devdata *dd, struct sdma_txreq *tx)
 	if (unlikely(tx->num_desc == MAX_DESC))
 		goto enomem;
 
-	descp = kmalloc_array(MAX_DESC, sizeof(struct sdma_desc), GFP_ATOMIC);
-	if (!descp)
+	tx->descp = kmalloc_array(
+			MAX_DESC,
+			sizeof(struct sdma_desc),
+			GFP_ATOMIC);
+	if (!tx->descp)
 		goto enomem;
-	tx->descp = descp;
 
 	/* reserve last descriptor for coalescing */
 	tx->desc_limit = MAX_DESC - 1;

@@ -833,7 +833,7 @@ static int raid10_congested(struct mddev *mddev, int bits)
 		if (rdev && !test_bit(Faulty, &rdev->flags)) {
 			struct request_queue *q = bdev_get_queue(rdev->bdev);
 
-			ret |= bdi_congested(&q->backing_dev_info, bits);
+			ret |= bdi_congested(q->backing_dev_info, bits);
 		}
 	}
 	rcu_read_unlock();
@@ -1734,7 +1734,6 @@ static int raid10_add_disk(struct mddev *mddev, struct md_rdev *rdev)
 		first = last = rdev->raid_disk;
 
 	if (rdev->saved_raid_disk >= first &&
-	    rdev->saved_raid_disk < conf->geo.raid_disks &&
 	    conf->mirrors[rdev->saved_raid_disk].rdev == NULL)
 		mirror = rdev->saved_raid_disk;
 	else
@@ -3735,13 +3734,6 @@ static int raid10_run(struct mddev *mddev)
 			    disk->rdev->saved_raid_disk < 0)
 				conf->fullsync = 1;
 		}
-
-		if (disk->replacement &&
-		    !test_bit(In_sync, &disk->replacement->flags) &&
-		    disk->replacement->saved_raid_disk < 0) {
-			conf->fullsync = 1;
-		}
-
 		disk->recovery_disabled = mddev->recovery_disabled - 1;
 	}
 
@@ -3770,8 +3762,8 @@ static int raid10_run(struct mddev *mddev)
 		 * maybe...
 		 */
 		stripe /= conf->geo.near_copies;
-		if (mddev->queue->backing_dev_info.ra_pages < 2 * stripe)
-			mddev->queue->backing_dev_info.ra_pages = 2 * stripe;
+		if (mddev->queue->backing_dev_info->ra_pages < 2 * stripe)
+			mddev->queue->backing_dev_info->ra_pages = 2 * stripe;
 	}
 
 	if (md_integrity_register(mddev))
@@ -3798,8 +3790,6 @@ static int raid10_run(struct mddev *mddev)
 		set_bit(MD_RECOVERY_RUNNING, &mddev->recovery);
 		mddev->sync_thread = md_register_thread(md_do_sync, mddev,
 							"reshape");
-		if (!mddev->sync_thread)
-			goto out_free_conf;
 	}
 
 	return 0;
@@ -4384,12 +4374,11 @@ static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr,
 		allow_barrier(conf);
 	}
 
-	raise_barrier(conf, 0);
 read_more:
 	/* Now schedule reads for blocks from sector_nr to last */
 	r10_bio = mempool_alloc(conf->r10buf_pool, GFP_NOIO);
 	r10_bio->state = 0;
-	raise_barrier(conf, 1);
+	raise_barrier(conf, sectors_done != 0);
 	atomic_set(&r10_bio->remaining, 0);
 	r10_bio->mddev = mddev;
 	r10_bio->sector = sector_nr;
@@ -4491,11 +4480,10 @@ bio_full:
 	atomic_inc(&r10_bio->remaining);
 	read_bio->bi_next = NULL;
 	generic_make_request(read_bio);
+	sector_nr += nr_sectors;
 	sectors_done += nr_sectors;
 	if (sector_nr <= last)
 		goto read_more;
-
-	lower_barrier(conf);
 
 	/* Now that we have done the whole section we can
 	 * update reshape_progress
@@ -4578,8 +4566,8 @@ static void end_reshape(struct r10conf *conf)
 		int stripe = conf->geo.raid_disks *
 			((conf->mddev->chunk_sectors << 9) / PAGE_SIZE);
 		stripe /= conf->geo.near_copies;
-		if (conf->mddev->queue->backing_dev_info.ra_pages < 2 * stripe)
-			conf->mddev->queue->backing_dev_info.ra_pages = 2 * stripe;
+		if (conf->mddev->queue->backing_dev_info->ra_pages < 2 * stripe)
+			conf->mddev->queue->backing_dev_info->ra_pages = 2 * stripe;
 	}
 	conf->fullsync = 0;
 }

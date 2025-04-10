@@ -123,7 +123,11 @@ EXPORT_SYMBOL_GPL(have_governor_per_policy);
 
 bool cpufreq_driver_is_slow(void)
 {
+#ifdef CONFIG_MTK_TINYSYS_SSPM_SUPPORT
+	return false;
+#else
 	return !(cpufreq_driver->flags & CPUFREQ_DRIVER_FAST);
+#endif
 }
 EXPORT_SYMBOL_GPL(cpufreq_driver_is_slow);
 
@@ -142,7 +146,7 @@ static inline u64 get_cpu_idle_time_jiffy(unsigned int cpu, u64 *wall)
 	u64 cur_wall_time;
 	u64 busy_time;
 
-	cur_wall_time = jiffies64_to_nsecs(get_jiffies_64());
+	cur_wall_time = jiffies64_to_cputime64(get_jiffies_64());
 
 	busy_time = kcpustat_cpu(cpu).cpustat[CPUTIME_USER];
 	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_SYSTEM];
@@ -153,9 +157,9 @@ static inline u64 get_cpu_idle_time_jiffy(unsigned int cpu, u64 *wall)
 
 	idle_time = cur_wall_time - busy_time;
 	if (wall)
-		*wall = div_u64(cur_wall_time, NSEC_PER_USEC);
+		*wall = cputime_to_usecs(cur_wall_time);
 
-	return div_u64(idle_time, NSEC_PER_USEC);
+	return cputime_to_usecs(idle_time);
 }
 
 u64 get_cpu_idle_time(unsigned int cpu, u64 *wall, int io_busy)
@@ -223,6 +227,14 @@ unsigned int cpufreq_generic_get(unsigned int cpu)
 	return clk_get_rate(policy->clk) / 1000;
 }
 EXPORT_SYMBOL_GPL(cpufreq_generic_get);
+
+#ifdef VENDOR_EDIT
+struct list_head *get_cpufreq_policy_list(void)
+{
+    return &cpufreq_policy_list;
+}
+EXPORT_SYMBOL(get_cpufreq_policy_list);
+#endif /* VENDOR_EDIT */
 
 /**
  * cpufreq_cpu_get: returns policy for a cpu and marks it busy.
@@ -315,11 +327,91 @@ static void adjust_jiffies(unsigned long val, struct cpufreq_freqs *ci)
  *               FREQUENCY INVARIANT CPU CAPACITY                    *
  *********************************************************************/
 
+static inline bool sched_assist(void)
+{
+#ifdef CONFIG_CPU_FREQ_SCHED_ASSIST
+return true;
+#else
+return false;
+#endif
+}
 static DEFINE_PER_CPU(unsigned long, freq_scale) = SCHED_CAPACITY_SCALE;
 static DEFINE_PER_CPU(unsigned long, max_freq_cpu);
 static DEFINE_PER_CPU(unsigned long, max_freq_scale) = SCHED_CAPACITY_SCALE;
 static DEFINE_PER_CPU(unsigned long, min_freq_scale);
 
+static void
+mtk_scale_freq_capacity(struct cpufreq_policy *policy, struct cpufreq_freqs *freqs)
+{
+	unsigned long cur = freqs ? freqs->new : policy->cur;
+	unsigned long scale;
+	struct cpufreq_cpuinfo *cpuinfo = &policy->cpuinfo;
+	int cpu, cid, sched_freq;
+#ifdef CONFIG_HOTPLUG_CPU
+	struct cpumask cls_cpus;
+#endif
+
+	cid = arch_get_cluster_id(policy->cpu);
+
+	sched_freq = get_sched_cur_freq(cid);
+
+#ifdef CONFIG_MTK_TINYSYS_SSPM_SUPPORT
+	/*
+	 * Consider current frequency for TINY-sys:
+	 *   sched gov: using get_sched_cur_freq()
+	 *   assist: update when no trigger in 20ms
+	 *   others: policy->cur
+	 */
+	if (sched_freq) {
+		/* sched-gov is used */
+		cur = sched_freq;
+		cur = clamp_t(int, cur, policy->min, policy->max);
+	}
+
+#endif
+
+	scale = (cur << SCHED_CAPACITY_SHIFT) / cpuinfo->max_freq;
+#ifdef CONFIG_HOTPLUG_CPU
+	arch_get_cluster_cpus(&cls_cpus, cid);
+
+	for_each_cpu(cpu, &cls_cpus) {
+		arch_scale_set_max_freq(cpu, policy->max);
+		arch_scale_set_min_freq(cpu, policy->min);
+
+		if (!sched_assist()) {
+			/* update current freqnecy */
+			per_cpu(freq_scale, cpu) = scale;
+			arch_scale_set_curr_freq(cpu, cur);
+		}
+	}
+#else
+	for_each_cpu(cpu, policy->cpus) {
+		arch_scale_set_max_freq(cpu, policy->max)
+		arch_scale_set_min_freq(cpu, policy->min);
+
+		if (!sched_assist()) {
+			/* update current freqnecy */
+			per_cpu(freq_scale, cpu) = scale;
+			arch_scale_set_curr_freq(cpu, cur);
+		}
+	}
+#endif
+
+	scale = (policy->max << SCHED_CAPACITY_SHIFT) / cpuinfo->max_freq;
+#ifdef CONFIG_HOTPLUG_CPU
+	for_each_cpu(cpu, &cls_cpus) {
+		per_cpu(max_freq_scale, cpu) = scale;
+	}
+#else
+	for_each_cpu(cpu, policy->cpus) {
+		per_cpu(max_freq_scale, cpu) = scale;
+	}
+#endif
+
+	pr_debug("cpus %*pbl cur max/max freq %u/%u kHz max freq scale %lu\n",
+		 cpumask_pr_args(policy->cpus), policy->max, cpuinfo->max_freq,
+		 scale);
+}
 static void
 scale_freq_capacity(const cpumask_t *cpus, unsigned long cur_freq,
 		    unsigned long max_freq)
@@ -334,11 +426,6 @@ scale_freq_capacity(const cpumask_t *cpus, unsigned long cur_freq,
 
 	pr_debug("cpus %*pbl cur freq/max freq %lu/%lu kHz freq scale %lu\n",
 		 cpumask_pr_args(cpus), cur_freq, max_freq, scale);
-}
-
-unsigned long cpufreq_scale_freq_capacity(struct sched_domain *sd, int cpu)
-{
-	return per_cpu(freq_scale, cpu);
 }
 
 static void
@@ -362,6 +449,11 @@ scale_max_freq_capacity(const cpumask_t *cpus, unsigned long policy_max_freq)
 
 	pr_debug("cpus %*pbl policy max freq/max freq %lu/%lu kHz max freq scale %lu\n",
 		 cpumask_pr_args(cpus), policy_max_freq, max_freq, scale);
+}
+
+unsigned long cpufreq_scale_freq_capacity(struct sched_domain *sd, int cpu)
+{
+	return per_cpu(freq_scale, cpu);
 }
 
 unsigned long cpufreq_scale_max_freq_capacity(struct sched_domain *sd, int cpu)
@@ -506,6 +598,7 @@ wait:
 	spin_unlock(&policy->transition_lock);
 
 	scale_freq_capacity(policy->cpus, freqs->new, policy->cpuinfo.max_freq);
+	mtk_scale_freq_capacity(policy, freqs);
 #ifdef CONFIG_SMP
 	for_each_cpu(cpu, policy->cpus)
 		trace_cpu_capacity(capacity_curr_of(cpu), cpu);
@@ -634,13 +727,13 @@ EXPORT_SYMBOL_GPL(cpufreq_driver_resolve_freq);
  *                          SYSFS INTERFACE                          *
  *********************************************************************/
 static ssize_t show_boost(struct kobject *kobj,
-			  struct kobj_attribute *attr, char *buf)
+				 struct attribute *attr, char *buf)
 {
 	return sprintf(buf, "%d\n", cpufreq_driver->boost_enabled);
 }
 
-static ssize_t store_boost(struct kobject *kobj, struct kobj_attribute *attr,
-			   const char *buf, size_t count)
+static ssize_t store_boost(struct kobject *kobj, struct attribute *attr,
+				  const char *buf, size_t count)
 {
 	int ret, enable;
 
@@ -981,9 +1074,6 @@ static ssize_t show(struct kobject *kobj, struct attribute *attr, char *buf)
 	struct freq_attr *fattr = to_attr(attr);
 	ssize_t ret;
 
-	if (!fattr->show)
-		return -EIO;
-
 	down_read(&policy->rwsem);
 	ret = fattr->show(policy, buf);
 	up_read(&policy->rwsem);
@@ -997,9 +1087,6 @@ static ssize_t store(struct kobject *kobj, struct attribute *attr,
 	struct cpufreq_policy *policy = to_policy(kobj);
 	struct freq_attr *fattr = to_attr(attr);
 	ssize_t ret = -EINVAL;
-
-	if (!fattr->store)
-		return -EIO;
 
 	get_online_cpus();
 
@@ -1101,12 +1188,17 @@ static int cpufreq_init_policy(struct cpufreq_policy *policy)
 	/* Update governor of new_policy to the governor used before hotplug */
 	gov = find_governor(policy->last_governor);
 	if (gov) {
-		pr_debug("Restoring governor %s for cpu %d\n",
+		pr_info("@@!Restoring governor %s for cpu %d\n",
 				policy->governor->name, policy->cpu);
 	} else {
 		gov = cpufreq_default_governor();
-		if (!gov)
+		pr_info("@@!Default governor %s for cpu %d\n",
+				gov->name, policy->cpu);
+
+		if (!gov) {
+			pr_info("@@!NO governor\n");
 			return -ENODATA;
+		}
 	}
 
 	new_policy.governor = gov;
@@ -1177,7 +1269,6 @@ static struct cpufreq_policy *cpufreq_policy_alloc(unsigned int cpu)
 				   cpufreq_global_kobject, "policy%u", cpu);
 	if (ret) {
 		pr_err("%s: failed to init policy->kobj: %d\n", __func__, ret);
-		kobject_put(&policy->kobj);
 		goto err_free_real_cpus;
 	}
 
@@ -1610,16 +1701,17 @@ static unsigned int __cpufreq_get(struct cpufreq_policy *policy)
 {
 	unsigned int ret_freq = 0;
 
-	if (unlikely(policy_is_inactive(policy)) || !cpufreq_driver->get)
+	if (!cpufreq_driver->get)
 		return ret_freq;
 
 	ret_freq = cpufreq_driver->get(policy->cpu);
 
 	/*
-	 * If fast frequency switching is used with the given policy, the check
+	 * Updating inactive policies is invalid, so avoid doing that.  Also
+	 * if fast frequency switching is used with the given policy, the check
 	 * against policy->cur is pointless, so skip it in that case too.
 	 */
-	if (policy->fast_switch_enabled)
+	if (unlikely(policy_is_inactive(policy)) || policy->fast_switch_enabled)
 		return ret_freq;
 
 	if (ret_freq && policy->cur &&
@@ -1757,9 +1849,6 @@ void cpufreq_resume(void)
 	int ret;
 
 	if (!cpufreq_driver)
-		return;
-
-	if (unlikely(!cpufreq_suspended))
 		return;
 
 	cpufreq_suspended = false;
@@ -2560,13 +2649,6 @@ int cpufreq_register_driver(struct cpufreq_driver *driver_data)
 	if (cpufreq_disabled())
 		return -ENODEV;
 
-	/*
-	 * The cpufreq core depends heavily on the availability of device
-	 * structure, make sure they are available before proceeding further.
-	 */
-	if (!get_cpu_device(0))
-		return -EPROBE_DEFER;
-
 	if (!driver_data || !driver_data->verify || !driver_data->init ||
 	    !(driver_data->setpolicy || driver_data->target_index ||
 		    driver_data->target) ||
@@ -2670,6 +2752,14 @@ int cpufreq_unregister_driver(struct cpufreq_driver *driver)
 }
 EXPORT_SYMBOL_GPL(cpufreq_unregister_driver);
 
+/*
+ * Stop cpufreq at shutdown to make sure it isn't holding any locks
+ * or mutexes when secondary CPUs are halted.
+ */
+static struct syscore_ops cpufreq_syscore_ops = {
+	.shutdown = cpufreq_suspend,
+};
+
 struct kobject *cpufreq_global_kobject;
 EXPORT_SYMBOL(cpufreq_global_kobject);
 
@@ -2680,6 +2770,8 @@ static int __init cpufreq_core_init(void)
 
 	cpufreq_global_kobject = kobject_create_and_add("cpufreq", &cpu_subsys.dev_root->kobj);
 	BUG_ON(!cpufreq_global_kobject);
+
+	register_syscore_ops(&cpufreq_syscore_ops);
 
 	return 0;
 }

@@ -30,12 +30,37 @@ struct mmc_gpio {
 	char cd_label[0];
 };
 
+#ifdef ODM_HQ_EDIT
+/*liujia@ODM_HQ.BSP.Kernel.Driver 2019.10.11 add sdcard poweroff quick*/
+extern void msdc_sd_power_off_quick(void);
+#endif /*ODM_HQ_EDIT*/
+
+#ifdef ODM_WT_EDIT//Yanchao.Hu@ODM_WT.BSP.Storage.Sdcard, 2018/10/30, Add for T-card ldo and eint state
+extern unsigned int cd_gpio;
+extern unsigned int cd_ldo_gpio;
+#endif /*ODM_WT_EDIT*/
+
 static irqreturn_t mmc_gpio_cd_irqt(int irq, void *dev_id)
 {
 	/* Schedule a card detection after a debounce timeout */
 	struct mmc_host *host = dev_id;
-
-	host->trigger_card_event = true;
+#ifdef ODM_HQ_EDIT
+/*liujia@ODM_HQ.BSP.Kernel.Driver 2019.10.11 add sdcard poweroff quick*/
+//qiaoweitao@ODM_WT.BSP.Kernel.Driver 2019.12.25 add sdcard poweroff quick
+#ifndef ODM_WT_EDIT
+	msdc_sd_power_off_quick();
+#else
+	if(!(__gpio_get_value(cd_gpio)))
+	{
+		__gpio_set_value(cd_ldo_gpio, 0);
+	}
+#endif /*ODM_WT_EDIT*/
+#endif /*ODM_HQ_EDIT*/
+	host->trigger_card_event = true;	
+#ifdef VENDOR_EDIT
+//yh@bsp, 2015-10-21 Add for special card compatible
+	host->card_stuck_in_programing_status = false;
+#endif /* VENDOR_EDIT */
 	mmc_detect_change(host, msecs_to_jiffies(200));
 
 	return IRQ_HANDLED;
@@ -141,10 +166,13 @@ void mmc_gpiod_request_cd_irq(struct mmc_host *host)
 			ctx->cd_gpio_isr = mmc_gpio_cd_irqt;
 		ret = devm_request_threaded_irq(host->parent, irq,
 			NULL, ctx->cd_gpio_isr,
-			IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+			IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING
+			| IRQF_ONESHOT,
 			ctx->cd_label, host);
 		if (ret < 0)
 			irq = ret;
+		else
+			enable_irq_wake(irq);
 	}
 
 	host->slot.cd_irq = irq;
