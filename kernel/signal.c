@@ -71,18 +71,9 @@ static int sig_task_ignored(struct task_struct *t, int sig, bool force)
 
 	handler = sig_handler(t, sig);
 
-	/* SIGKILL and SIGSTOP may not be sent to the global init */
-	if (unlikely(is_global_init(t) && sig_kernel_only(sig)))
-		return true;
-
 	if (unlikely(t->signal->flags & SIGNAL_UNKILLABLE) &&
 	    handler == SIG_DFL && !(force && sig_kernel_only(sig)))
 		return 1;
-
-	/* Only allow kernel generated signals to this kthread */
-	if (unlikely((t->flags & PF_KTHREAD) &&
-		     (handler == SIG_KTHREAD_KERNEL) && !force))
-		return true;
 
 	return sig_handler_ignored(handler, sig);
 }
@@ -373,32 +364,27 @@ __sigqueue_alloc(int sig, struct task_struct *t, gfp_t flags, int override_rlimi
 {
 	struct sigqueue *q = NULL;
 	struct user_struct *user;
-	int sigpending;
 
 	/*
 	 * Protect access to @t credentials. This can go away when all
 	 * callers hold rcu read lock.
-	 *
-	 * NOTE! A pending signal will hold on to the user refcount,
-	 * and we get/put the refcount only when the sigpending count
-	 * changes from/to zero.
 	 */
 	rcu_read_lock();
-	user = __task_cred(t)->user;
-	sigpending = atomic_inc_return(&user->sigpending);
-	if (sigpending == 1)
-		get_uid(user);
+	user = get_uid(__task_cred(t)->user);
+	atomic_inc(&user->sigpending);
 	rcu_read_unlock();
 
-	if (override_rlimit || likely(sigpending <= task_rlimit(t, RLIMIT_SIGPENDING))) {
+	if (override_rlimit ||
+	    atomic_read(&user->sigpending) <=
+			task_rlimit(t, RLIMIT_SIGPENDING)) {
 		q = kmem_cache_alloc(sigqueue_cachep, flags);
 	} else {
 		print_dropped_signal(sig);
 	}
 
 	if (unlikely(q == NULL)) {
-		if (atomic_dec_and_test(&user->sigpending))
-			free_uid(user);
+		atomic_dec(&user->sigpending);
+		free_uid(user);
 	} else {
 		INIT_LIST_HEAD(&q->list);
 		q->flags = 0;
@@ -412,8 +398,8 @@ static void __sigqueue_free(struct sigqueue *q)
 {
 	if (q->flags & SIGQUEUE_PREALLOC)
 		return;
-	if (atomic_dec_and_test(&q->user->sigpending))
-		free_uid(q->user);
+	atomic_dec(&q->user->sigpending);
+	free_uid(q->user);
 	kmem_cache_free(sigqueue_cachep, q);
 }
 
@@ -710,48 +696,6 @@ static inline bool si_fromuser(const struct siginfo *info)
 		(!is_si_special(info) && SI_FROMUSER(info));
 }
 
-static int dequeue_synchronous_signal(siginfo_t *info)
-{
-	struct task_struct *tsk = current;
-	struct sigpending *pending = &tsk->pending;
-	struct sigqueue *q, *sync = NULL;
-
-	/*
-	 * Might a synchronous signal be in the queue?
-	 */
-	if (!((pending->signal.sig[0] & ~tsk->blocked.sig[0]) & SYNCHRONOUS_MASK))
-		return 0;
-
-	/*
-	 * Return the first synchronous signal in the queue.
-	 */
-	list_for_each_entry(q, &pending->list, list) {
-		/* Synchronous signals have a postive si_code */
-		if ((q->info.si_code > SI_USER) &&
-		    (sigmask(q->info.si_signo) & SYNCHRONOUS_MASK)) {
-			sync = q;
-			goto next;
-		}
-	}
-	return 0;
-next:
-	/*
-	 * Check if there is another siginfo for the same signal.
-	 */
-	list_for_each_entry_continue(q, &pending->list, list) {
-		if (q->info.si_signo == sync->info.si_signo)
-			goto still_pending;
-	}
-
-	sigdelset(&pending->signal, sync->info.si_signo);
-	recalc_sigpending();
-still_pending:
-	list_del_init(&sync->list);
-	copy_siginfo(info, &sync->info);
-	__sigqueue_free(sync);
-	return info->si_signo;
-}
-
 /*
  * called with RCU read lock from check_kill_permission()
  */
@@ -854,8 +798,11 @@ static bool prepare_signal(int sig, struct task_struct *p, bool force)
 	sigset_t flush;
 
 	if (signal->flags & (SIGNAL_GROUP_EXIT | SIGNAL_GROUP_COREDUMP)) {
-		if (!(signal->flags & SIGNAL_GROUP_EXIT))
-			return sig == SIGKILL;
+		if (signal->flags & SIGNAL_GROUP_COREDUMP) {
+			pr_debug("[%d:%s] skip sig %d due to coredump is doing\n",
+					p->pid, p->comm, sig);
+			return 0;
+		}
 		/*
 		 * The process is in the middle of dying, nothing to do.
 		 */
@@ -1035,6 +982,55 @@ static inline void userns_fixup_signal_uid(struct siginfo *info, struct task_str
 }
 #endif
 
+#ifdef VENDOR_EDIT
+//Li.Liu@PSW.AD.Stability.Crash.1054829, 2016/10/08, Add for merging fangpan@oppo.com modify for the sender who kill system_server
+static bool is_zygote_process(struct task_struct *t)
+{
+	const struct cred *tcred = __task_cred(t);
+
+	struct task_struct * first_child = NULL;
+	if(t->children.next && t->children.next != (struct list_head*)&t->children.next)
+		first_child = container_of(t->children.next, struct task_struct, sibling);
+	if(!strcmp(t->comm, "main") && (tcred->uid.val == 0) && (t->parent != 0 && !strcmp(t->parent->comm,"init"))  )
+		return true;
+	else
+		return false;
+	return false;
+}
+static bool is_systemserver_process(struct task_struct *t) {
+    if (!strcmp(t->comm, "system_server")) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+static bool is_key_process(struct task_struct *t) {
+    struct pid *pgrp;
+    struct task_struct *taskp;
+
+    if (t->pid == t->tgid) {
+        if (is_systemserver_process(t) || is_zygote_process(t)) {
+            return true;
+        }
+    } else {
+        pgrp = task_pgrp(t);
+        if (pgrp != NULL) {
+            taskp = pid_task(pgrp, PIDTYPE_PID);
+            if (taskp != NULL && (is_systemserver_process(taskp) || is_zygote_process(taskp))) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+#endif
+
+#ifdef VENDOR_EDIT
+/*fanhui@PhoneSW.BSP, 2016-06-21, DeathHealer, record the SIGSTOP sender*/
+extern char last_stopper_comm[];
+#endif
 static int __send_signal(int sig, struct siginfo *info, struct task_struct *t,
 			int group, int from_ancestor_ns)
 {
@@ -1042,12 +1038,45 @@ static int __send_signal(int sig, struct siginfo *info, struct task_struct *t,
 	struct sigqueue *q;
 	int override_rlimit;
 	int ret = 0, result;
+#if defined(VENDOR_EDIT) && defined(CONFIG_ELSA_STUB)
+//zhoumingjun@Swdp.shanghai, 2017/05/18, notify userspace when kill cgroup frozen tasks
+	struct process_event_data pe_data;
+#endif
 
 	assert_spin_locked(&t->sighand->siglock);
 
 	result = TRACE_SIGNAL_IGNORED;
+
+#ifdef VENDOR_EDIT
+//Li.Liu@PSW.AD.Stability.Crash.1054829, 2016/10/08, Add for merging fangpan@oppo.com modify for the sender who kill system_server
+  if(1) {
+	  /*add the SIGKILL print log for some debug*/
+	  if((sig == SIGHUP || sig == 33 || sig == SIGKILL || sig == SIGSTOP || sig == SIGABRT || sig == SIGTERM
+	  	 || sig == SIGCONT) && is_key_process(t)) {
+	    printk("Some other process %d:%s want to send sig:%d to pid:%d tgid:%d comm:%s\n", current->pid, current->comm,sig, t->pid, t->tgid, t->comm);
+	  }
+  }
+#endif
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_DEATH_HEALER) && !defined(CONFIG_OPPO_SPECIAL_BUILD)
+/*fanhui@PhoneSW.BSP, 2016-06-21, DeathHealer, record the SIGSTOP sender*/
+	if (sig == SIGSTOP && (!strncmp(t->comm,"main", TASK_COMM_LEN) ||
+		!strncmp(t->comm,"system_server", TASK_COMM_LEN) || !strncmp(t->comm,"surfaceflinger", TASK_COMM_LEN)))
+		snprintf(last_stopper_comm, 64, "%s[%d]", current->comm, current->pid);
+#endif
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_ELSA_STUB)
+//zhoumingjun@Swdp.shanghai, 2017/05/18, notify userspace when kill cgroup frozen tasks
+	if (sig == SIGKILL && (freezing(t) || frozen(t)) && cgroup_freezing(t)) {
+		pe_data.pid = task_pid_nr(t);
+		pe_data.uid = task_uid(t);
+		pe_data.reason = sig;
+		process_event_notifier_call_chain_atomic(PROCESS_EVENT_SIGNAL_FROZEN, &pe_data);
+	}
+#endif
+
 	if (!prepare_signal(sig, t,
-			from_ancestor_ns || (info == SEND_SIG_PRIV) || (info == SEND_SIG_FORCED)))
+			from_ancestor_ns || (info == SEND_SIG_FORCED)))
 		goto ret;
 
 	pending = group ? &t->signal->shared_pending : &t->pending;
@@ -1313,6 +1342,10 @@ struct sighand_struct *__lock_task_sighand(struct task_struct *tsk,
 
 	return sighand;
 }
+#ifdef VENDOR_EDIT
+//jie.cheng@Swdp.shanghai, 2017/06/02, export kernel symbol
+EXPORT_SYMBOL(__lock_task_sighand);
+#endif
 
 /*
  * send signal info to all the members of a group
@@ -1660,7 +1693,7 @@ bool do_notify_parent(struct task_struct *tsk, int sig)
 		 * This is only possible if parent == real_parent.
 		 * Check if it has changed security domain.
 		 */
-		if (tsk->parent_exec_id != READ_ONCE(tsk->parent->self_exec_id))
+		if (tsk->parent_exec_id != tsk->parent->self_exec_id)
 			sig = SIGCHLD;
 	}
 
@@ -1824,6 +1857,16 @@ static inline int may_ptrace_stop(void)
 }
 
 /*
+ * Return non-zero if there is a SIGKILL that should be waking us up.
+ * Called with the siglock held.
+ */
+static int sigkill_pending(struct task_struct *tsk)
+{
+	return	sigismember(&tsk->pending.signal, SIGKILL) ||
+		sigismember(&tsk->signal->shared_pending.signal, SIGKILL);
+}
+
+/*
  * This must be called with current->sighand->siglock held.
  *
  * This should be the path for all ptrace stops.
@@ -1848,10 +1891,15 @@ static void ptrace_stop(int exit_code, int why, int clear_code, siginfo_t *info)
 		 * calling arch_ptrace_stop, so we must release it now.
 		 * To preserve proper semantics, we must do this before
 		 * any signal bookkeeping like checking group_stop_count.
+		 * Meanwhile, a SIGKILL could come in before we retake the
+		 * siglock.  That must prevent us from sleeping in TASK_TRACED.
+		 * So after regaining the lock, we must check for SIGKILL.
 		 */
 		spin_unlock_irq(&current->sighand->siglock);
 		arch_ptrace_stop(exit_code, info);
 		spin_lock_irq(&current->sighand->siglock);
+		if (sigkill_pending(current))
+			return;
 	}
 
 	/*
@@ -1860,8 +1908,6 @@ static void ptrace_stop(int exit_code, int why, int clear_code, siginfo_t *info)
 	 * Also, transition to TRACED and updates to ->jobctl should be
 	 * atomic with respect to siglock and should be done after the arch
 	 * hook as siglock is released and regrabbed across it.
-	 * schedule() will not sleep if there is a pending signal that
-	 * can awaken the task.
 	 */
 	set_current_state(TASK_TRACED);
 
@@ -2241,16 +2287,6 @@ relock:
 		goto relock;
 	}
 
-	/* Has this task already been marked for death? */
-	if (signal_group_exit(signal)) {
-		ksig->info.si_signo = signr = SIGKILL;
-		sigdelset(&current->pending.signal, SIGKILL);
-		trace_signal_deliver(SIGKILL, SEND_SIG_NOINFO,
-				&sighand->action[SIGKILL - 1]);
-		recalc_sigpending();
-		goto fatal;
-	}
-
 	for (;;) {
 		struct k_sigaction *ka;
 
@@ -2264,15 +2300,7 @@ relock:
 			goto relock;
 		}
 
-		/*
-		 * Signals generated by the execution of an instruction
-		 * need to be delivered before any other pending signals
-		 * so that the instruction pointer in the signal stack
-		 * frame points to the faulting instruction.
-		 */
-		signr = dequeue_synchronous_signal(&ksig->info);
-		if (!signr)
-			signr = dequeue_signal(current, &current->blocked, &ksig->info);
+		signr = dequeue_signal(current, &current->blocked, &ksig->info);
 
 		if (!signr)
 			break; /* will return 0 */
@@ -2354,7 +2382,6 @@ relock:
 			continue;
 		}
 
-	fatal:
 		spin_unlock_irq(&sighand->siglock);
 
 		/*
@@ -3178,8 +3205,7 @@ int do_sigaction(int sig, struct k_sigaction *act, struct k_sigaction *oact)
 }
 
 static int
-do_sigaltstack (const stack_t __user *uss, stack_t __user *uoss, unsigned long sp,
-		size_t min_ss_size)
+do_sigaltstack (const stack_t __user *uss, stack_t __user *uoss, unsigned long sp)
 {
 	stack_t oss;
 	int error;
@@ -3218,8 +3244,9 @@ do_sigaltstack (const stack_t __user *uss, stack_t __user *uoss, unsigned long s
 			ss_size = 0;
 			ss_sp = NULL;
 		} else {
-			if (unlikely(ss_size < min_ss_size))
-				return -ENOMEM;
+			error = -ENOMEM;
+			if (ss_size < MINSIGSTKSZ)
+				goto out;
 		}
 
 		current->sas_ss_sp = (unsigned long) ss_sp;
@@ -3242,14 +3269,12 @@ out:
 }
 SYSCALL_DEFINE2(sigaltstack,const stack_t __user *,uss, stack_t __user *,uoss)
 {
-	return do_sigaltstack(uss, uoss, current_user_stack_pointer(),
-			      MINSIGSTKSZ);
+	return do_sigaltstack(uss, uoss, current_user_stack_pointer());
 }
 
 int restore_altstack(const stack_t __user *uss)
 {
-	int err = do_sigaltstack(uss, NULL, current_user_stack_pointer(),
-			      		MINSIGSTKSZ);
+	int err = do_sigaltstack(uss, NULL, current_user_stack_pointer());
 	/* squash all but EFAULT for now */
 	return err == -EFAULT ? err : 0;
 }
@@ -3290,8 +3315,7 @@ COMPAT_SYSCALL_DEFINE2(sigaltstack,
 	set_fs(KERNEL_DS);
 	ret = do_sigaltstack((stack_t __force __user *) (uss_ptr ? &uss : NULL),
 			     (stack_t __force __user *) &uoss,
-			     compat_user_stack_pointer(),
-			     COMPAT_MINSIGSTKSZ);
+			     compat_user_stack_pointer());
 	set_fs(seg);
 	if (ret >= 0 && uoss_ptr)  {
 		if (!access_ok(VERIFY_WRITE, uoss_ptr, sizeof(compat_stack_t)) ||

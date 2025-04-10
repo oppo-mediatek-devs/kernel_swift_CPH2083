@@ -1564,7 +1564,6 @@ static int rebind_subsystems(struct cgroup_root *dst_root, u16 ss_mask)
 	struct cgroup *dcgrp = &dst_root->cgrp;
 	struct cgroup_subsys *ss;
 	int ssid, i, ret;
-	u16 dfl_disable_ss_mask = 0;
 
 	lockdep_assert_held(&cgroup_mutex);
 
@@ -1581,27 +1580,7 @@ static int rebind_subsystems(struct cgroup_root *dst_root, u16 ss_mask)
 		/* can't move between two non-dummy roots either */
 		if (ss->root != &cgrp_dfl_root && dst_root != &cgrp_dfl_root)
 			return -EBUSY;
-
-		/*
-		 * Collect ssid's that need to be disabled from default
-		 * hierarchy.
-		 */
-		if (ss->root == &cgrp_dfl_root)
-			dfl_disable_ss_mask |= 1 << ssid;
-
 	} while_each_subsys_mask();
-
-	if (dfl_disable_ss_mask) {
-		struct cgroup *scgrp = &cgrp_dfl_root.cgrp;
-
-		/*
-		 * Controllers from default hierarchy that need to be rebound
-		 * are all disabled together in one go.
-		 */
-		cgrp_dfl_root.subsys_mask &= ~dfl_disable_ss_mask;
-		WARN_ON(cgroup_apply_control(scgrp));
-		cgroup_finalize_control(scgrp, 0);
-	}
 
 	do_each_subsys_mask(ss, ssid, ss_mask) {
 		struct cgroup_root *src_root = ss->root;
@@ -1611,12 +1590,10 @@ static int rebind_subsystems(struct cgroup_root *dst_root, u16 ss_mask)
 
 		WARN_ON(!css || cgroup_css(dcgrp, ss));
 
-		if (src_root != &cgrp_dfl_root) {
-			/* disable from the source */
-			src_root->subsys_mask &= ~(1 << ssid);
-			WARN_ON(cgroup_apply_control(scgrp));
-			cgroup_finalize_control(scgrp, 0);
-		}
+		/* disable from the source */
+		src_root->subsys_mask &= ~(1 << ssid);
+		WARN_ON(cgroup_apply_control(scgrp));
+		cgroup_finalize_control(scgrp, 0);
 
 		/* rebind */
 		RCU_INIT_POINTER(scgrp->subsys[ssid], NULL);
@@ -2411,6 +2388,50 @@ int task_cgroup_path(struct task_struct *task, char *buf, size_t buflen)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(task_cgroup_path);
+
+#ifdef VENDOR_EDIT
+//zhoumingjun@Swdp.shanghai, 2018/07/10, get task cgroup path by root name for elsa
+//huangliang@Swdp.shanghai, 2018/07/23, porting from 4.9 to 4.4 for elsa
+int task_cgroup_path_by_root(struct task_struct *task, const char *rootname,  char *buf, size_t buflen)
+{
+	struct cgroup_root *root;
+	struct cgroup *cgrp;
+	bool root_found = false;
+	int ret = 0;
+	struct cgroup_subsys *ss;
+	int ssid, rootssid = -1;
+
+	mutex_lock(&cgroup_mutex);
+	spin_lock_irq(&css_set_lock);
+
+	/* find root subsys id by name */
+	for_each_subsys(ss, ssid) {
+		if (!strcmp(ss->legacy_name, rootname)) {
+			rootssid = ssid;
+			break;
+		}
+	}
+
+	if (rootssid >= 0) {
+		for_each_root(root) {
+			if (root && (root->subsys_mask & (1 << rootssid))) {
+				cgrp = task_cgroup_from_root(task, root);
+				ret = cgroup_path_ns_locked(cgrp, buf, buflen, &init_cgroup_ns);
+				root_found = true;
+				break;
+			}
+		}
+	}
+
+	if (!root_found)
+		ret = strlcpy(buf, "/", buflen);
+
+	spin_unlock_irq(&css_set_lock);
+	mutex_unlock(&cgroup_mutex);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(task_cgroup_path_by_root);
+#endif
 
 /* used to track tasks and other necessary states during migration */
 struct cgroup_taskset {
@@ -3622,10 +3643,6 @@ static int cgroup_rename(struct kernfs_node *kn, struct kernfs_node *new_parent,
 	struct cgroup *cgrp = kn->priv;
 	int ret;
 
-	/* do not accept '\n' to prevent making /proc/<pid>/cgroup unparsable */
-	if (strchr(new_name_str, '\n'))
-		return -EINVAL;
-
 	if (kernfs_type(kn) != KERNFS_DIR)
 		return -ENOTDIR;
 	if (kn->parent != new_parent)
@@ -4414,11 +4431,7 @@ int cgroup_transfer_tasks(struct cgroup *to, struct cgroup *from)
 	 */
 	do {
 		css_task_iter_start(&from->self, &it);
-
-		do {
-			task = css_task_iter_next(&it);
-		} while (task && (task->flags & PF_EXITING));
-
+		task = css_task_iter_next(&it);
 		if (task)
 			get_task_struct(task);
 		css_task_iter_end(&it);
@@ -5669,6 +5682,8 @@ int __init cgroup_init_early(void)
 	return 0;
 }
 
+static u16 cgroup_disable_mask __initdata;
+
 /**
  * cgroup_init - cgroup initialization
  *
@@ -5726,8 +5741,12 @@ int __init cgroup_init(void)
 		 * disabled flag and cftype registration needs kmalloc,
 		 * both of which aren't available during early_init.
 		 */
-		if (!cgroup_ssid_enabled(ssid))
+		if (cgroup_disable_mask & (1 << ssid)) {
+			static_branch_disable(cgroup_subsys_enabled_key[ssid]);
+			printk(KERN_INFO "Disabling %s control group subsystem\n",
+			       ss->name);
 			continue;
+		}
 
 		if (cgroup_ssid_no_v1(ssid))
 			printk(KERN_INFO "Disabling %s control group subsystem in v1 mounts\n",
@@ -6170,10 +6189,7 @@ static int __init cgroup_disable(char *str)
 			if (strcmp(token, ss->name) &&
 			    strcmp(token, ss->legacy_name))
 				continue;
-
-			static_branch_disable(cgroup_subsys_enabled_key[i]);
-			pr_info("Disabling %s control group subsystem\n",
-				ss->name);
+			cgroup_disable_mask |= 1 << i;
 		}
 	}
 	return 1;
@@ -6356,14 +6372,14 @@ void cgroup_sk_alloc_disable(void)
 
 void cgroup_sk_alloc(struct sock_cgroup_data *skcd)
 {
-	if (cgroup_sk_alloc_disabled) {
-		skcd->no_refcnt = 1;
+	if (cgroup_sk_alloc_disabled)
+		return;
+
+	/* Socket clone path */
+	if (skcd->val) {
+		cgroup_get(sock_cgroup_ptr(skcd));
 		return;
 	}
-
-	/* Don't associate the sock with unrelated interrupted task's cgroup. */
-	if (in_interrupt())
-		return;
 
 	rcu_read_lock();
 
@@ -6381,26 +6397,8 @@ void cgroup_sk_alloc(struct sock_cgroup_data *skcd)
 	rcu_read_unlock();
 }
 
-void cgroup_sk_clone(struct sock_cgroup_data *skcd)
-{
-	/* Socket clone path */
-	if (skcd->val) {
-		if (skcd->no_refcnt)
-			return;
-		/*
-		 * We might be cloning a socket which is left in an empty
-		 * cgroup and the cgroup might have already been rmdir'd.
-		 * Don't use cgroup_get_live().
-		 */
-		cgroup_get(sock_cgroup_ptr(skcd));
-	}
-}
-
 void cgroup_sk_free(struct sock_cgroup_data *skcd)
 {
-	if (skcd->no_refcnt)
-		return;
-
 	cgroup_put(sock_cgroup_ptr(skcd));
 }
 
@@ -6646,7 +6644,7 @@ static int cgroup_css_links_read(struct seq_file *seq, void *v)
 		struct task_struct *task;
 		int count = 0;
 
-		seq_printf(seq, "css_set %p\n", cset);
+		seq_printf(seq, "css_set %pK\n", cset);
 
 		list_for_each_entry(task, &cset->tasks, cg_list) {
 			if (count++ > MAX_TASKS_SHOWN_PER_CSS)

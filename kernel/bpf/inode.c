@@ -325,7 +325,7 @@ out:
 static struct bpf_prog *__get_prog_inode(struct inode *inode, enum bpf_prog_type type)
 {
 	struct bpf_prog *prog;
-	int ret = inode_permission(inode, MAY_READ);
+	int ret = inode_permission(inode, MAY_READ | MAY_WRITE);
 	if (ret)
 		return ERR_PTR(ret);
 
@@ -377,7 +377,7 @@ static const struct super_operations bpf_super_ops = {
 
 static int bpf_fill_super(struct super_block *sb, void *data, int silent)
 {
-	static struct tree_descr bpf_rfiles[] = { { "" } };
+	static const struct tree_descr bpf_rfiles[] = { { "" } };
 	struct inode *inode;
 	int ret;
 

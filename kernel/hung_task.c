@@ -15,10 +15,26 @@
 #include <linux/lockdep.h>
 #include <linux/export.h>
 #include <linux/sysctl.h>
-#include <linux/suspend.h>
 #include <linux/utsname.h>
 #include <trace/events/sched.h>
 
+#ifdef VENDOR_EDIT
+/* fanhui@PhoneSW.BSP, 2016/02/02, DeathHealer, record the hung task killing
+ * format: task_name,reason. e.g. system_server,uninterruptible for 60 secs
+ */
+#define HUNG_TASK_OPPO_KILL_LEN	128
+char __read_mostly sysctl_hung_task_oppo_kill[HUNG_TASK_OPPO_KILL_LEN];
+char last_stopper_comm[64];
+
+#define TWICE_DEATH_PERIOD	300000000000ULL	//300s
+#define MAX_DEATH_COUNT	3
+#endif
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_DEATH_HEALER)
+/* Wen.Luo@BSP.Kernel.Stability, 2019/01/12, DeathHealer , Foreground background optimization,change max io count */
+#define MAX_IO_WAIT_HUNG 5
+int __read_mostly sysctl_hung_task_maxiowait_count = MAX_IO_WAIT_HUNG;
+#endif
 /*
  * The number of tasks checked:
  */
@@ -31,7 +47,7 @@ int __read_mostly sysctl_hung_task_check_count = PID_MAX_LIMIT;
  * is disabled during the critical section. It also controls the size of
  * the RCU grace period. So it needs to be upper-bound.
  */
-#define HUNG_TASK_LOCK_BREAK (HZ / 10)
+#define HUNG_TASK_BATCHING 1024
 
 /*
  * Zero means infinite timeout - no checking done:
@@ -73,17 +89,64 @@ static struct notifier_block panic_block = {
 	.notifier_call = hung_task_panic,
 };
 
+#if defined(VENDOR_EDIT)
+//yixue.ge@PhoneSW.BSP,20170228 modify for use is_zygote64_process replace "main"
+static bool is_zygote_process(struct task_struct *t)
+{
+	const struct cred *tcred = __task_cred(t);
+	if(!strcmp(t->comm, "main") && (tcred->uid.val == 0) && (t->parent != 0 && !strcmp(t->parent->comm,"init"))  )
+		return true;
+	else
+		return false;
+	return false;
+}
+#endif
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_DEATH_HEALER)
+static void check_hung_task(struct task_struct *t, unsigned long timeout, unsigned int *iowait_count)
+#else
 static void check_hung_task(struct task_struct *t, unsigned long timeout)
+#endif
 {
 	unsigned long switch_count = t->nvcsw + t->nivcsw;
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_DEATH_HEALER)
+	static unsigned long long last_death_time = 0;
+	unsigned long long cur_death_time = 0;
+	static int death_count = 0;
+#endif /* VENDOR_EDIT */
+
+#ifdef VENDOR_EDIT
+	if(!strncmp(t->comm,"mdss_dsi_event", TASK_COMM_LEN)||
+		!strncmp(t->comm,"msm-core:sampli", TASK_COMM_LEN)||
+		!strncmp(t->comm,"kworker/u16:1", TASK_COMM_LEN) ||
+		!strncmp(t->comm,"mdss_fb0", TASK_COMM_LEN)||
+		!strncmp(t->comm,"mdss_fb_ffl0", TASK_COMM_LEN)||
+		!strncmp(t->comm,"opmonitor_boot", TASK_COMM_LEN)||
+		!strncmp(t->comm,"panic_flush", TASK_COMM_LEN)) {
+		return;
+	}
+#endif
 
 	/*
 	 * Ensure the task is not frozen.
 	 * Also, skip vfork and any other user process that freezer should skip.
 	 */
 	if (unlikely(t->flags & (PF_FROZEN | PF_FREEZER_SKIP)))
-	    return;
-
+#if defined(VENDOR_EDIT) && defined(CONFIG_DEATH_HEALER)
+/* fanhui@PhoneSW.BSP, 2016/02/02, DeathHealer, kill D/T/t state tasks */
+	{
+		if (is_zygote_process(t) || !strncmp(t->comm,"system_server", TASK_COMM_LEN)
+			|| !strncmp(t->comm,"surfaceflinger", TASK_COMM_LEN)) {
+			if (t->flags & PF_FROZEN)
+				return;
+		}
+		else
+			return;
+	}
+#else
+		return;
+#endif
 	/*
 	 * When a freshly created task is scheduled once, changes its state to
 	 * TASK_UNINTERRUPTIBLE without having ever been switched out once, it
@@ -99,7 +162,53 @@ static void check_hung_task(struct task_struct *t, unsigned long timeout)
 
 	trace_sched_process_hang(t);
 
-	if (!sysctl_hung_task_warnings && !sysctl_hung_task_panic)
+#if defined(VENDOR_EDIT) && defined(CONFIG_DEATH_HEALER)
+/* fanhui@PhoneSW.BSP, 2016/02/02, DeathHealer, kill D/T/t state tasks */
+	//if this task blocked at iowait. so maybe we should reboot system first
+	if(t->in_iowait){
+		printk(KERN_ERR "DeathHealer io wait too long time\n");
+		*iowait_count = *iowait_count + 1;
+	}
+	if (is_zygote_process(t) || !strncmp(t->comm,"system_server", TASK_COMM_LEN)
+		|| !strncmp(t->comm,"surfaceflinger", TASK_COMM_LEN) ) {
+		if (t->state == TASK_UNINTERRUPTIBLE)
+			snprintf(sysctl_hung_task_oppo_kill, HUNG_TASK_OPPO_KILL_LEN, "%s,uninterruptible for %ld seconds", t->comm, timeout);
+		else if (t->state == TASK_STOPPED)
+			snprintf(sysctl_hung_task_oppo_kill, HUNG_TASK_OPPO_KILL_LEN, "%s,stopped for %ld seconds by %s", t->comm, timeout, last_stopper_comm);
+		else if (t->state == TASK_TRACED)
+			snprintf(sysctl_hung_task_oppo_kill, HUNG_TASK_OPPO_KILL_LEN, "%s,traced for %ld seconds", t->comm, timeout);
+		else
+			snprintf(sysctl_hung_task_oppo_kill, HUNG_TASK_OPPO_KILL_LEN, "%s,unknown hung for %ld seconds", t->comm, timeout);
+
+		printk(KERN_ERR "DeathHealer: task %s:%d blocked for more than %ld seconds in state 0x%lx. Count:%d\n",
+			t->comm, t->pid, timeout, t->state, death_count+1);
+
+		death_count++;
+		cur_death_time = local_clock();
+		if (death_count >= MAX_DEATH_COUNT) {
+			if (cur_death_time - last_death_time < TWICE_DEATH_PERIOD) {
+				printk(KERN_ERR "DeathHealer has been triggered %d times, \
+					last time at: %llu\n", death_count, last_death_time);
+				BUG();
+			}
+		}
+		last_death_time = cur_death_time;
+
+#ifdef CONFIG_OPPO_SPECIAL_BUILD
+		BUG();
+#else
+		sched_show_task(t);
+		debug_show_held_locks(t);
+		trigger_all_cpu_backtrace();
+
+		t->flags |= PF_OPPO_KILLING;
+		do_send_sig_info(SIGKILL, SEND_SIG_FORCED, t, true);
+		wake_up_process(t);
+#endif
+	}
+#endif
+
+	if (!sysctl_hung_task_warnings)
 		return;
 
 	/*
@@ -123,8 +232,19 @@ static void check_hung_task(struct task_struct *t, unsigned long timeout)
 	touch_nmi_watchdog();
 
 	if (sysctl_hung_task_panic) {
-		trigger_all_cpu_backtrace();
-		panic("hung_task: blocked tasks");
+#ifdef VENDOR_EDIT
+/* Hui.Fan@SWDP.BSP.Kernel.Debug, 2017-05-01
+ * Panic on critical process D-state
+ */
+		if (is_zygote_process(t) || !strncmp(t->comm,"system_server", TASK_COMM_LEN)
+			|| !strncmp(t->comm,"surfaceflinger", TASK_COMM_LEN)) {
+			trigger_all_cpu_backtrace();
+#ifndef CONFIG_OPPO_SPECIAL_BUILD
+/* Fuchun.Liao@BSP.CHG.Basci 2018/05/14 modify for debug when agetest */
+			panic("hung_task: blocked tasks");
+#endif /* CONFIG_OPPO_SPECIAL_BUILD */
+		}
+#endif
 	}
 }
 
@@ -156,11 +276,29 @@ static bool rcu_lock_break(struct task_struct *g, struct task_struct *t)
  * a really long time (120 seconds). If that happens, print out
  * a warning.
  */
+#if defined(VENDOR_EDIT) && defined(CONFIG_OPPO_HEALTHINFO)
+// wenbin.liu@PSW.PLATFORM.KERNEL, 2018/12/19
+// Add for iowait hung ctrl set by QualityProtect APK RUS
+extern bool ohm_iopanic_mon_ctrl;
+extern bool ohm_iopanic_mon_logon;
+extern bool ohm_iopanic_mon_trig;
+extern unsigned int  iowait_hung_cnt;
+extern unsigned int  iowait_panic_cnt;
+#else
+bool ohm_iopanic_mon_ctrl = true;
+bool ohm_iopanic_mon_logon = false;
+bool ohm_iopanic_mon_trig = false;
+unsigned int  iowait_hung_cnt = 0;
+unsigned int  iowait_panic_cnt = 0;
+#endif /*VENDOR_EDIT*/
 static void check_hung_uninterruptible_tasks(unsigned long timeout)
 {
 	int max_count = sysctl_hung_task_check_count;
-	unsigned long last_break = jiffies;
+	int batch_count = HUNG_TASK_BATCHING;
 	struct task_struct *g, *t;
+#if defined(VENDOR_EDIT) && defined(CONFIG_DEATH_HEALER)
+	unsigned int iowait_count = 0;
+#endif
 
 	/*
 	 * If the system crashed already then all bets are off,
@@ -173,16 +311,40 @@ static void check_hung_uninterruptible_tasks(unsigned long timeout)
 	for_each_process_thread(g, t) {
 		if (!max_count--)
 			goto unlock;
-		if (time_after(jiffies, last_break + HUNG_TASK_LOCK_BREAK)) {
+		if (!--batch_count) {
+			batch_count = HUNG_TASK_BATCHING;
 			if (!rcu_lock_break(g, t))
 				goto unlock;
-			last_break = jiffies;
 		}
 		/* use "==" to skip the TASK_KILLABLE tasks waiting on NFS */
+#if defined(VENDOR_EDIT) && defined(CONFIG_DEATH_HEALER)
+/* fanhui@PhoneSW.BSP, 2016/02/02, DeathHealer, detect D/T/t state tasks */
+/*yixue.ge@PhoneSW.BSP,20180305,add io wait monitor*/
+		if (t->state == TASK_UNINTERRUPTIBLE || t->state == TASK_STOPPED || t->state == TASK_TRACED)
+			check_hung_task(t, timeout,&iowait_count);
+#else
 		if (t->state == TASK_UNINTERRUPTIBLE)
 			check_hung_task(t, timeout);
+#endif
 	}
  unlock:
+#if defined(VENDOR_EDIT) && defined(CONFIG_DEATH_HEALER)
+/* yixue.ge@PhoneSW.BSP,20180305,add io wait monitor */
+/* Wen.Luo@BSP.Kernel.Stability, 2019/01/12, DeathHealer , Foreground background optimization,change max io count */
+	if(iowait_count >= sysctl_hung_task_maxiowait_count){
+		#ifdef CONFIG_OPPO_SPECIAL_BUILD
+		panic("hung_task:[%u]IO blocked too long time",iowait_count);
+		#endif
+		if (!ohm_iopanic_mon_ctrl){
+			//panic("hung_task:[%u]IO blocked too long time",iowait_count);
+			pr_err("hung_task:[%u]IO blocked too long time\n",iowait_count);
+		}
+		else
+			iowait_panic_cnt++;
+	}
+    iowait_hung_cnt += iowait_count;
+#endif
+
 	rcu_read_unlock();
 }
 
@@ -222,28 +384,6 @@ void reset_hung_task_detector(void)
 }
 EXPORT_SYMBOL_GPL(reset_hung_task_detector);
 
-static bool hung_detector_suspended;
-
-static int hungtask_pm_notify(struct notifier_block *self,
-			      unsigned long action, void *hcpu)
-{
-	switch (action) {
-	case PM_SUSPEND_PREPARE:
-	case PM_HIBERNATION_PREPARE:
-	case PM_RESTORE_PREPARE:
-		hung_detector_suspended = true;
-		break;
-	case PM_POST_SUSPEND:
-	case PM_POST_HIBERNATION:
-	case PM_POST_RESTORE:
-		hung_detector_suspended = false;
-		break;
-	default:
-		break;
-	}
-	return NOTIFY_OK;
-}
-
 /*
  * kthread which checks for tasks stuck in D state
  */
@@ -258,8 +398,7 @@ static int watchdog(void *dummy)
 		long t = hung_timeout_jiffies(hung_last_checked, timeout);
 
 		if (t <= 0) {
-			if (!atomic_xchg(&reset_hung_task, 0) &&
-			    !hung_detector_suspended)
+			if (!atomic_xchg(&reset_hung_task, 0))
 				check_hung_uninterruptible_tasks(timeout);
 			hung_last_checked = jiffies;
 			continue;
@@ -273,10 +412,6 @@ static int watchdog(void *dummy)
 static int __init hung_task_init(void)
 {
 	atomic_notifier_chain_register(&panic_notifier_list, &panic_block);
-
-	/* Disable hung task detector on suspend */
-	pm_notifier(hungtask_pm_notify, 0);
-
 	watchdog_task = kthread_run(watchdog, NULL, "khungtaskd");
 
 	return 0;

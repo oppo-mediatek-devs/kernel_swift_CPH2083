@@ -995,8 +995,6 @@ SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
 	strlcpy(last_unloaded_module, mod->name, sizeof(last_unloaded_module));
 
 	free_module(mod);
-	/* someone could wait for the module in add_unformed_module() */
-	wake_up_all(&module_wq);
 	return 0;
 out:
 	mutex_unlock(&module_mutex);
@@ -1762,6 +1760,7 @@ static int mod_sysfs_init(struct module *mod)
 	if (err)
 		mod_kobject_put(mod);
 
+	/* delay uevent until full sysfs population */
 out:
 	return err;
 }
@@ -1795,6 +1794,7 @@ static int mod_sysfs_setup(struct module *mod,
 	add_sect_attrs(mod, info);
 	add_notes_attrs(mod, info);
 
+	kobject_uevent(&mod->mkobj.kobj, KOBJ_ADD);
 	return 0;
 
 out_unreg_param:
@@ -2215,21 +2215,6 @@ static int verify_export_symbols(struct module *mod)
 	return 0;
 }
 
-static bool ignore_undef_symbol(Elf_Half emachine, const char *name)
-{
-	/*
-	 * On x86, PIC code and Clang non-PIC code may have call foo@PLT. GNU as
-	 * before 2.37 produces an unreferenced _GLOBAL_OFFSET_TABLE_ on x86-64.
-	 * i386 has a similar problem but may not deserve a fix.
-	 *
-	 * If we ever have to ignore many symbols, consider refactoring the code to
-	 * only warn if referenced by a relocation.
-	 */
-	if (emachine == EM_386 || emachine == EM_X86_64)
-		return !strcmp(name, "_GLOBAL_OFFSET_TABLE_");
-	return false;
-}
-
 /* Change all symbols so that st_value encodes the pointer directly. */
 static int simplify_symbols(struct module *mod, const struct load_info *info)
 {
@@ -2275,10 +2260,8 @@ static int simplify_symbols(struct module *mod, const struct load_info *info)
 				break;
 			}
 
-			/* Ok if weak or ignored.  */
-			if (!ksym &&
-			    (ELF_ST_BIND(sym[i].st_info) == STB_WEAK ||
-			     ignore_undef_symbol(info->hdr->e_machine, name)))
+			/* Ok if weak.  */
+			if (!ksym && ELF_ST_BIND(sym[i].st_info) == STB_WEAK)
 				break;
 
 			pr_warn("%s: Unknown symbol %s (err %li)\n",
@@ -3379,7 +3362,8 @@ static bool finished_loading(const char *name)
 	sched_annotate_sleep();
 	mutex_lock(&module_mutex);
 	mod = find_module_all(name, strlen(name), true);
-	ret = !mod || mod->state == MODULE_STATE_LIVE;
+	ret = !mod || mod->state == MODULE_STATE_LIVE
+		|| mod->state == MODULE_STATE_GOING;
 	mutex_unlock(&module_mutex);
 
 	return ret;
@@ -3452,9 +3436,6 @@ static noinline int do_init_module(struct module *mod)
 	mod->state = MODULE_STATE_LIVE;
 	blocking_notifier_call_chain(&module_notify_list,
 				     MODULE_STATE_LIVE, mod);
-
-	/* Delay uevent until module has finished its init routine */
-	kobject_uevent(&mod->mkobj.kobj, KOBJ_ADD);
 
 	/*
 	 * We need to finish all async code before the module init sequence
@@ -3545,7 +3526,8 @@ again:
 	mutex_lock(&module_mutex);
 	old = find_module_all(mod->name, strlen(mod->name), true);
 	if (old != NULL) {
-		if (old->state != MODULE_STATE_LIVE) {
+		if (old->state == MODULE_STATE_COMING
+		    || old->state == MODULE_STATE_UNFORMED) {
 			/* Wait in case it fails to load. */
 			mutex_unlock(&module_mutex);
 			err = wait_event_interruptible(module_wq,
@@ -3767,7 +3749,6 @@ static int load_module(struct load_info *info, const char __user *uargs,
 				     MODULE_STATE_GOING, mod);
 	klp_module_going(mod);
  bug_cleanup:
-	mod->state = MODULE_STATE_GOING;
 	/* module_bug_cleanup needs module_mutex protection */
 	mutex_lock(&module_mutex);
 	module_bug_cleanup(mod);
@@ -4041,7 +4022,7 @@ static unsigned long mod_find_symname(struct module *mod, const char *name)
 
 	for (i = 0; i < kallsyms->num_symtab; i++)
 		if (strcmp(name, symname(kallsyms, i)) == 0 &&
-		    kallsyms->symtab[i].st_shndx != SHN_UNDEF)
+		    kallsyms->symtab[i].st_info != 'U')
 			return kallsyms->symtab[i].st_value;
 	return 0;
 }
@@ -4087,10 +4068,6 @@ int module_kallsyms_on_each_symbol(int (*fn)(void *, const char *,
 		if (mod->state == MODULE_STATE_UNFORMED)
 			continue;
 		for (i = 0; i < kallsyms->num_symtab; i++) {
-
-			if (kallsyms->symtab[i].st_shndx == SHN_UNDEF)
-				continue;
-
 			ret = fn(data, symname(kallsyms, i),
 				 mod, kallsyms->symtab[i].st_value);
 			if (ret != 0)
@@ -4340,12 +4317,67 @@ void print_modules(void)
 	list_for_each_entry_rcu(mod, &modules, list) {
 		if (mod->state == MODULE_STATE_UNFORMED)
 			continue;
+#if 0
 		pr_cont(" %s%s", mod->name, module_flags(mod, buf));
+#else
+		pr_cont(" %s %p %p %d %d %s",
+			mod->name,
+			mod->core_layout.base,
+			mod->init_layout.base,
+			mod->core_layout.size,
+			mod->init_layout.size,
+			module_flags(mod, buf));
+#endif
 	}
 	preempt_enable();
 	if (last_unloaded_module[0])
 		pr_cont(" [last unloaded: %s]", last_unloaded_module);
 	pr_cont("\n");
+}
+
+int __weak do_translation_fault_preconditioner(unsigned long addr)
+{
+	return -1;
+}
+
+/* MUST ensure called when preempt disabled already */
+int save_modules(char *mbuf, int mbufsize)
+{
+	struct module *mod;
+	char buf[8];
+	/*int off = 0;*/
+	int sz = 0;
+
+	if (mbuf == NULL || mbufsize <= 0) {
+		pr_cont("mrdump: module info buffer wrong(sz:%d)\n", mbufsize);
+		return 0;
+	}
+
+	memset(mbuf, '\0', mbufsize);
+	sz += snprintf(mbuf + sz, mbufsize - sz, "Modules linked in:");
+	list_for_each_entry_rcu(mod, &modules, list) {
+		do_translation_fault_preconditioner((unsigned long)mod);
+		if (mod->state == MODULE_STATE_UNFORMED)
+			continue;
+		if (sz >= mbufsize) {
+			pr_cont("mrdump: module info buffer full(sz:%d)\n",
+				mbufsize);
+			break;
+		}
+		sz += snprintf(mbuf + sz, mbufsize - sz, " %s %p %p %d %d %s",
+				mod->name,
+				mod->core_layout.base,
+				mod->init_layout.base,
+				mod->core_layout.size,
+				mod->init_layout.size,
+				module_flags(mod, buf));
+	}
+	if (last_unloaded_module[0] && sz < mbufsize)
+		sz += snprintf(mbuf + sz, mbufsize - sz, " [last unloaded: %s]",
+				last_unloaded_module);
+	if (sz < mbufsize)
+		sz += snprintf(mbuf + sz, mbufsize - sz, "\n");
+	return sz;
 }
 
 #ifdef CONFIG_MODVERSIONS

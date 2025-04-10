@@ -338,6 +338,23 @@ static bool has_stopped_jobs(struct pid *pgrp)
 	return false;
 }
 
+#ifdef VENDOR_EDIT
+//Shu.Liu@PSW.AD.Stability.Crash.1054829, 2014/01/20, Add for not kill zygote
+static bool oppo_is_android_core_group(struct pid *pgrp)
+{
+	struct task_struct *p;
+
+	do_each_pid_task(pgrp, PIDTYPE_PGID, p) {
+		if (( !strcmp(p->comm, "zygote") ) || ( !strcmp(p->comm, "main")) ) {
+			printk("oppo_is_android_core_group: find zygote will be hungup, ignore it \n");
+			return true;
+		}
+	} while_each_pid_task(pgrp, PIDTYPE_PGID, p);
+
+	return false;
+}
+#endif /* VENDOR_EDIT */
+
 /*
  * Check to see if any process groups have become orphaned as
  * a result of our exiting, and if they have any stopped jobs,
@@ -364,6 +381,13 @@ kill_orphaned_pgrp(struct task_struct *tsk, struct task_struct *parent)
 	    task_session(parent) == task_session(tsk) &&
 	    will_become_orphaned_pgrp(pgrp, ignored_task) &&
 	    has_stopped_jobs(pgrp)) {
+#ifdef VENDOR_EDIT
+//Shu.Liu@PSW.AD.Stability.Crash.1054829, 2014/01/10, Add for clean backstage
+		if (oppo_is_android_core_group(pgrp)) {
+			printk("kill_orphaned_pgrp: find android core process will be hungup, ignored it, only hungup itself:%s:%d , current=%d \n",tsk->comm,tsk->pid,current->pid);
+			return;
+		}
+#endif /* VENDOR_EDIT */
 		__kill_pgrp_info(SIGHUP, SEND_SIG_PRIV, pgrp);
 		__kill_pgrp_info(SIGCONT, SEND_SIG_PRIV, pgrp);
 	}
@@ -466,7 +490,7 @@ static void exit_mm(struct task_struct *tsk)
 	struct mm_struct *mm = tsk->mm;
 	struct core_state *core_state;
 
-	exit_mm_release(tsk, mm);
+	mm_release(tsk, mm);
 	if (!mm)
 		return;
 	sync_mm_rss(mm);
@@ -485,10 +509,7 @@ static void exit_mm(struct task_struct *tsk)
 		up_read(&mm->mmap_sem);
 
 		self.task = tsk;
-		if (self.task->flags & PF_SIGNALED)
-			self.next = xchg(&core_state->dumper.next, &self);
-		else
-			self.task = NULL;
+		self.next = xchg(&core_state->dumper.next, &self);
 		/*
 		 * Implies mb(), the result of xchg() must be visible
 		 * to core_state->dumper.
@@ -530,14 +551,12 @@ static struct task_struct *find_alive_thread(struct task_struct *p)
 	return NULL;
 }
 
-static struct task_struct *find_child_reaper(struct task_struct *father,
-						struct list_head *dead)
+static struct task_struct *find_child_reaper(struct task_struct *father)
 	__releases(&tasklist_lock)
 	__acquires(&tasklist_lock)
 {
 	struct pid_namespace *pid_ns = task_active_pid_ns(father);
 	struct task_struct *reaper = pid_ns->child_reaper;
-	struct task_struct *p, *n;
 
 	if (likely(reaper != father))
 		return reaper;
@@ -553,12 +572,6 @@ static struct task_struct *find_child_reaper(struct task_struct *father,
 		panic("Attempted to kill init! exitcode=0x%08x\n",
 			father->signal->group_exit_code ?: father->exit_code);
 	}
-
-	list_for_each_entry_safe(p, n, dead, ptrace_entry) {
-		list_del_init(&p->ptrace_entry);
-		release_task(p);
-	}
-
 	zap_pid_ns_processes(pid_ns);
 	write_lock_irq(&tasklist_lock);
 
@@ -645,7 +658,7 @@ static void forget_original_parent(struct task_struct *father,
 		exit_ptrace(father, dead);
 
 	/* Can drop and reacquire tasklist_lock */
-	reaper = find_child_reaper(father, dead);
+	reaper = find_child_reaper(father);
 	if (list_empty(&father->children))
 		return;
 
@@ -738,18 +751,58 @@ static void check_stack_usage(void)
 static inline void check_stack_usage(void) {}
 #endif
 
+//#ifdef VENDOR_EDIT
+//Haoran.Zhang@PSW.AD.Stability.Crash.1054829,2016/05/24, Add for debug critical svc crash
+static bool is_zygote_process(struct task_struct *t)
+{
+	const struct cred *tcred = __task_cred(t);
+
+	struct task_struct * first_child = NULL;
+	if(t->children.next && t->children.next != (struct list_head*)&t->children.next)
+		first_child = container_of(t->children.next, struct task_struct, sibling);
+	if(!strcmp(t->comm, "main") && (tcred->uid.val == 0) && (t->parent != 0 && !strcmp(t->parent->comm,"init"))  )
+		return true;
+	else
+		return false;
+	return false;
+}
+
+static bool is_critial_process(struct task_struct *t) {
+    if(t->group_leader && (!strcmp(t->group_leader->comm, "system_server") || is_zygote_process(t) || !strcmp(t->group_leader->comm, "surfaceflinger") || !strcmp(t->group_leader->comm, "servicemanager"))) 
+    {
+       if (t->pid == t->tgid)
+       {
+          return true;
+       }
+       else
+       {
+          return false;
+       }
+    } else {
+        return false;
+    }
+
+}
+//#endif /*VENDOR_EDIT*/
+
 void __noreturn do_exit(long code)
 {
 	struct task_struct *tsk = current;
 	int group_dead;
+#if defined(VENDOR_EDIT) && defined(CONFIG_ELSA_STUB)
+//zhoumingjun@Swdp.shanghai, 2017/04/19, add process_event_notifier support
+	struct process_event_data pe_data;
+#endif
 	TASKS_RCU(int tasks_rcu_i);
+//#ifdef VENDOR_EDIT
+//Haoran.Zhang@PSW.AD.Stability.Crash.1054829,2016/05/24, Add for debug critical svc crash
+    if (is_critial_process(tsk)) {
+        printk("critical svc %d:%s exit with %ld !\n", tsk->pid, tsk->comm,code);
+    }
+//#endif /*VENDOR_EDIT*/
 
-	/*
-	 * We can get here from a kernel oops, sometimes with preemption off.
-	 * Start by checking for critical errors.
-	 * Then fix up important state like USER_DS and preemption.
-	 * Then do everything else.
-	 */
+	profile_task_exit(tsk);
+	kcov_task_exit(tsk);
 
 	WARN_ON(blk_needs_flush_plug(tsk));
 
@@ -767,19 +820,17 @@ void __noreturn do_exit(long code)
 	 */
 	set_fs(USER_DS);
 
-	if (unlikely(in_atomic())) {
-		pr_info("note: %s[%d] exited with preempt_count %d\n",
-			current->comm, task_pid_nr(current),
-			preempt_count());
-		preempt_count_set(PREEMPT_ENABLED);
-	}
-
-	profile_task_exit(tsk);
-	kcov_task_exit(tsk);
-
 	ptrace_event(PTRACE_EVENT_EXIT, code);
 
 	validate_creds_for_do_exit(tsk);
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_ELSA_STUB)
+//zhoumingjun@Swdp.shanghai, 2017/04/19, add process_event_notifier support
+	pe_data.pid = tsk->pid;
+	pe_data.uid = tsk->real_cred->uid;
+	pe_data.reason = code;
+	process_event_notifier_call_chain(PROCESS_EVENT_EXIT, &pe_data);
+#endif
 
 	/*
 	 * We're taking recursive faults here in do_exit. Safest is to just
@@ -787,7 +838,16 @@ void __noreturn do_exit(long code)
 	 */
 	if (unlikely(tsk->flags & PF_EXITING)) {
 		pr_alert("Fixing recursive fault but reboot is needed!\n");
-		futex_exit_recursive(tsk);
+		/*
+		 * We can do this unlocked here. The futex code uses
+		 * this flag just to verify whether the pi state
+		 * cleanup has been done or not. In the worst case it
+		 * loops once more. We pretend that the cleanup was
+		 * done as there is no way to return. Either the
+		 * OWNER_DIED bit is set by now or we push the blocked
+		 * task into the wait for ever nirwana as well.
+		 */
+		tsk->flags |= PF_EXITPIDONE;
 		set_current_state(TASK_UNINTERRUPTIBLE);
 		schedule();
 	}
@@ -795,6 +855,24 @@ void __noreturn do_exit(long code)
 	exit_signals(tsk);  /* sets PF_EXITING */
 
 	schedtune_exit_task(tsk);
+
+	/*
+	 * Ensure that all new tsk->pi_lock acquisitions must observe
+	 * PF_EXITING. Serializes against futex.c:attach_to_pi_owner().
+	 */
+	smp_mb();
+	/*
+	 * Ensure that we must observe the pi_state in exit_mm() ->
+	 * mm_release() -> exit_pi_state_list().
+	 */
+	raw_spin_unlock_wait(&tsk->pi_lock);
+
+	if (unlikely(in_atomic())) {
+		pr_info("note: %s[%d] exited with preempt_count %d\n",
+			current->comm, task_pid_nr(current),
+			preempt_count());
+		preempt_count_set(PREEMPT_ENABLED);
+	}
 
 	/* sync mm's RSS info before statistics gathering */
 	if (tsk->mm)
@@ -861,6 +939,12 @@ void __noreturn do_exit(long code)
 	 * Make sure we are holding no locks:
 	 */
 	debug_check_no_locks_held();
+	/*
+	 * We can do this unlocked here. The futex code uses this flag
+	 * just to verify whether the pi state cleanup has been done
+	 * or not. In the worst case it loops once more.
+	 */
+	tsk->flags |= PF_EXITPIDONE;
 
 	if (tsk->io_context)
 		exit_io_context(tsk);

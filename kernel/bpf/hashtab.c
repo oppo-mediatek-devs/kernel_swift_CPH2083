@@ -158,10 +158,10 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
 	int err, i;
 	u64 cost;
 
-	BUILD_BUG_ON(offsetof(struct htab_elem, htab) !=
-		     offsetof(struct htab_elem, hash_node.pprev));
+    BUILD_BUG_ON(offsetof(struct htab_elem, htab) !=
+		offsetof(struct htab_elem, hash_node.pprev));
 	BUILD_BUG_ON(offsetof(struct htab_elem, fnode.next) !=
-		     offsetof(struct htab_elem, hash_node.pprev));
+		offsetof(struct htab_elem, hash_node.pprev));
 
 	if (attr->map_flags & ~HTAB_CREATE_FLAG_MASK)
 		/* reserved bits should not be used */
@@ -280,19 +280,22 @@ static inline u32 htab_map_hash(const void *key, u32 key_len)
 	return jhash(key, key_len, 0);
 }
 
-static inline struct bucket *__select_bucket(struct bpf_htab *htab, u32 hash)
+static inline struct bucket
+	*__select_bucket(struct bpf_htab *htab, u32 hash)
 {
 	return &htab->buckets[hash & (htab->n_buckets - 1)];
 }
 
-static inline struct hlist_nulls_head *select_bucket(struct bpf_htab *htab, u32 hash)
+static inline struct hlist_nulls_head
+	*select_bucket(struct bpf_htab *htab, u32 hash)
 {
 	return &__select_bucket(htab, hash)->head;
 }
 
 /* this lookup function can only be called with bucket lock taken */
-static struct htab_elem *lookup_elem_raw(struct hlist_nulls_head *head, u32 hash,
-					 void *key, u32 key_size)
+static struct htab_elem
+	*lookup_elem_raw(struct hlist_nulls_head *head, u32 hash,
+			void *key, u32 key_size)
 {
 	struct hlist_nulls_node *n;
 	struct htab_elem *l;
@@ -385,8 +388,10 @@ static int htab_map_get_next_key(struct bpf_map *map, void *key, void *next_key)
 		goto find_first_elem;
 
 	/* key was found, get next key in the same bucket */
-	next_l = hlist_nulls_entry_safe(rcu_dereference_raw(hlist_nulls_next_rcu(&l->hash_node)),
-				  struct htab_elem, hash_node);
+	next_l =
+		hlist_nulls_entry_safe(rcu_dereference_raw
+			(hlist_nulls_next_rcu(&l->hash_node)),
+			struct htab_elem, hash_node);
 
 	if (next_l) {
 		/* if next elem in this hash list is non-zero, just return it */
@@ -404,8 +409,10 @@ find_first_elem:
 		head = select_bucket(htab, i);
 
 		/* pick first element in the bucket */
-		next_l = hlist_nulls_entry_safe(rcu_dereference_raw(hlist_nulls_first_rcu(head)),
-					  struct htab_elem, hash_node);
+		next_l =
+			hlist_nulls_entry_safe(rcu_dereference_raw
+				(hlist_nulls_first_rcu(head)),
+				struct htab_elem, hash_node);
 		if (next_l) {
 			/* if it's not empty, just return it */
 			memcpy(next_key, next_l->key, key_size);
@@ -429,7 +436,15 @@ static void htab_elem_free_rcu(struct rcu_head *head)
 	struct htab_elem *l = container_of(head, struct htab_elem, rcu);
 	struct bpf_htab *htab = l->htab;
 
+	/* must increment bpf_prog_active to avoid kprobe+bpf triggering while
+	 * we're calling kfree, otherwise deadlock is possible if kprobes
+	 * are placed somewhere inside of slub
+	 */
+	preempt_disable();
+	__this_cpu_inc(bpf_prog_active);
 	htab_elem_free(htab, l);
+	__this_cpu_dec(bpf_prog_active);
+	preempt_enable();
 }
 
 static void free_htab_elem(struct bpf_htab *htab, struct htab_elem *l)

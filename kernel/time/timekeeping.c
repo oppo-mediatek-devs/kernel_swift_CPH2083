@@ -24,6 +24,7 @@
 #include <linux/pvclock_gtod.h>
 #include <linux/compiler.h>
 
+#include <mt-plat/mtk_ccci_common.h>
 #include "tick-internal.h"
 #include "ntp_internal.h"
 #include "timekeeping_internal.h"
@@ -39,9 +40,7 @@
 static struct {
 	seqcount_t		seq;
 	struct timekeeper	timekeeper;
-} tk_core ____cacheline_aligned = {
-	.seq = SEQCNT_ZERO(tk_core.seq),
-};
+} tk_core ____cacheline_aligned;
 
 static DEFINE_RAW_SPINLOCK(timekeeper_lock);
 static struct timekeeper shadow_timekeeper;
@@ -987,8 +986,9 @@ static int scale64_check_overflow(u64 mult, u64 div, u64 *base)
 	    ((int)sizeof(u64)*8 - fls64(mult) < fls64(rem)))
 		return -EOVERFLOW;
 	tmp *= mult;
+	rem *= mult;
 
-	rem = div64_u64(rem * mult, div);
+	do_div(rem, div);
 	*base = tmp + rem;
 	return 0;
 }
@@ -1235,7 +1235,8 @@ int do_settimeofday64(const struct timespec64 *ts)
 	timekeeping_forward_now(tk);
 
 	xt = tk_xtime(tk);
-	ts_delta = timespec64_sub(*ts, xt);
+	ts_delta.tv_sec = ts->tv_sec - xt.tv_sec;
+	ts_delta.tv_nsec = ts->tv_nsec - xt.tv_nsec;
 
 	if (timespec64_compare(&tk->wall_to_monotonic, &ts_delta) > 0) {
 		ret = -EINVAL;
@@ -1253,7 +1254,7 @@ out:
 
 	/* signal hrtimers about time change */
 	clock_was_set();
-
+	notify_time_update();
 	return ret;
 }
 EXPORT_SYMBOL(do_settimeofday64);

@@ -2,6 +2,13 @@
 # Makefile for the linux kernel.
 #
 
+subdir-ccflags-y += -Werror
+subdir-ccflags-y += -I$(srctree)/drivers/misc/mediatek/include
+subdir-ccflags-y += -I$(srctree)/drivers/misc/mediatek/include/mt-plat
+subdir-ccflags-y += -I$(srctree)/drivers/misc/mediatek/mtprof
+subdir-ccflags-y += -I$(srctree)/drivers/misc/mediatek/sched
+subdir-ccflags-y += -I$(srctree)/drivers/misc/mediatek/base/power/mcdi/include
+
 obj-y     = fork.o exec_domain.o panic.o \
 	    cpu.o exit.o softirq.o resource.o \
 	    sysctl.o sysctl_binary.o capability.o ptrace.o user.o \
@@ -28,7 +35,6 @@ KCOV_INSTRUMENT_extable.o := n
 # Don't self-instrument.
 KCOV_INSTRUMENT_kcov.o := n
 KASAN_SANITIZE_kcov.o := n
-CFLAGS_kcov.o := $(call cc-option, -fno-conserve-stack -fno-stack-protector)
 
 # cond_syscall is currently not LTO compatible
 CFLAGS_sys_ni.o = $(DISABLE_LTO)
@@ -44,12 +50,20 @@ obj-y += irq/
 obj-y += rcu/
 obj-y += livepatch/
 
+
+#ifdef VENDOR_EDIT
+#Liujie.Xie@TECH.Kernel.Sched, 2019/05/22, add for ui first
+obj-y += oppocfs/
+
 obj-$(CONFIG_CHECKPOINT_RESTORE) += kcmp.o
 obj-$(CONFIG_FREEZER) += freezer.o
 obj-$(CONFIG_PROFILING) += profile.o
 obj-$(CONFIG_STACKTRACE) += stacktrace.o
 obj-y += time/
 obj-$(CONFIG_FUTEX) += futex.o
+ifeq ($(CONFIG_COMPAT),y)
+obj-$(CONFIG_FUTEX) += futex_compat.o
+endif
 obj-$(CONFIG_GENERIC_ISA_DMA) += dma.o
 obj-$(CONFIG_SMP) += smp.o
 ifneq ($(CONFIG_SMP),y)
@@ -93,6 +107,7 @@ obj-$(CONFIG_TASK_DELAY_ACCT) += delayacct.o
 obj-$(CONFIG_TASKSTATS) += taskstats.o tsacct.o
 obj-$(CONFIG_TRACEPOINTS) += tracepoint.o
 obj-$(CONFIG_LATENCYTOP) += latencytop.o
+obj-$(CONFIG_ELFCORE) += elfcore.o
 obj-$(CONFIG_FUNCTION_TRACER) += trace/
 obj-$(CONFIG_TRACING) += trace/
 obj-$(CONFIG_TRACE_CLOCK) += trace/
@@ -127,3 +142,8 @@ $(obj)/config_data.gz: $(KCONFIG_CONFIG) FORCE
 targets += config_data.h
 $(obj)/config_data.h: $(obj)/config_data.gz FORCE
 	$(call filechk,ikconfiggz)
+    
+#ifdef VENDOR_EDIT
+#Liang.Zhang@PSW.TECH.BOOTUP, 2018/11/16, Add for panic recovery
+#ifdef HANG_OPPO_ALL
+obj-$(CONFIG_HANG_OPPO_ALL) += op_panic_recovery.o
