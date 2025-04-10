@@ -2,6 +2,8 @@
 # Cryptographic API
 #
 
+subdir-ccflags-y += -Werror
+
 obj-$(CONFIG_CRYPTO) += crypto.o
 crypto-y := api.o cipher.o compress.o memneq.o
 
@@ -50,6 +52,7 @@ rsa_generic-y += rsa.o
 rsa_generic-y += rsa_helper.o
 rsa_generic-y += rsa-pkcs1pad.o
 obj-$(CONFIG_CRYPTO_RSA) += rsa_generic.o
+obj-$(CONFIG_CRYPTO_ACOMP2) += scompress.o
 
 cryptomgr-y := algboss.o testmgr.o
 
@@ -133,7 +136,7 @@ obj-$(CONFIG_CRYPTO_USER_API_HASH) += algif_hash.o
 obj-$(CONFIG_CRYPTO_USER_API_SKCIPHER) += algif_skcipher.o
 obj-$(CONFIG_CRYPTO_USER_API_RNG) += algif_rng.o
 obj-$(CONFIG_CRYPTO_USER_API_AEAD) += algif_aead.o
-
+obj-$(CONFIG_CRYPTO_ZSTD) += zstd.o
 #
 # generic algorithms and the async_tx api
 #

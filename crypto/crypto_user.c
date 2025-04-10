@@ -55,9 +55,6 @@ static struct crypto_alg *crypto_alg_match(struct crypto_user_alg *p, int exact)
 	list_for_each_entry(q, &crypto_alg_list, cra_list) {
 		int match = 0;
 
-		if (crypto_is_larval(q))
-			continue;
-
 		if ((q->cra_flags ^ p->cru_type) & p->cru_mask)
 			continue;
 
@@ -108,6 +105,21 @@ static int crypto_report_comp(struct sk_buff *skb, struct crypto_alg *alg)
 	strncpy(rcomp.type, "compression", sizeof(rcomp.type));
 	if (nla_put(skb, CRYPTOCFGA_REPORT_COMPRESS,
 		    sizeof(struct crypto_report_comp), &rcomp))
+		goto nla_put_failure;
+	return 0;
+
+nla_put_failure:
+	return -EMSGSIZE;
+}
+
+static int crypto_report_acomp(struct sk_buff *skb, struct crypto_alg *alg)
+{
+	struct crypto_report_acomp racomp;
+
+	strncpy(racomp.type, "acomp", sizeof(racomp.type));
+
+	if (nla_put(skb, CRYPTOCFGA_REPORT_ACOMP,
+		    sizeof(struct crypto_report_acomp), &racomp))
 		goto nla_put_failure;
 	return 0;
 
@@ -189,7 +201,11 @@ static int crypto_report_one(struct crypto_alg *alg,
 			goto nla_put_failure;
 
 		break;
+	case CRYPTO_ALG_TYPE_ACOMPRESS:
+		if (crypto_report_acomp(skb, alg))
+			goto nla_put_failure;
 
+		break;
 	case CRYPTO_ALG_TYPE_AKCIPHER:
 		if (crypto_report_akcipher(skb, alg))
 			goto nla_put_failure;
@@ -269,43 +285,38 @@ static int crypto_report(struct sk_buff *in_skb, struct nlmsghdr *in_nlh,
 drop_alg:
 	crypto_mod_put(alg);
 
-	if (err) {
-		kfree_skb(skb);
+	if (err)
 		return err;
-	}
 
 	return nlmsg_unicast(crypto_nlsk, skb, NETLINK_CB(in_skb).portid);
 }
 
 static int crypto_dump_report(struct sk_buff *skb, struct netlink_callback *cb)
 {
-	const size_t start_pos = cb->args[0];
-	size_t pos = 0;
-	struct crypto_dump_info info;
 	struct crypto_alg *alg;
-	int res;
+	struct crypto_dump_info info;
+	int err;
+
+	if (cb->args[0])
+		goto out;
+
+	cb->args[0] = 1;
 
 	info.in_skb = cb->skb;
 	info.out_skb = skb;
 	info.nlmsg_seq = cb->nlh->nlmsg_seq;
 	info.nlmsg_flags = NLM_F_MULTI;
 
-	down_read(&crypto_alg_sem);
 	list_for_each_entry(alg, &crypto_alg_list, cra_list) {
-		if (pos >= start_pos) {
-			res = crypto_report_alg(alg, &info);
-			if (res == -EMSGSIZE)
-				break;
-			if (res)
-				goto out;
-		}
-		pos++;
+		err = crypto_report_alg(alg, &info);
+		if (err)
+			goto out_err;
 	}
-	cb->args[0] = pos;
-	res = skb->len;
+
 out:
-	up_read(&crypto_alg_sem);
-	return res;
+	return skb->len;
+out_err:
+	return err;
 }
 
 static int crypto_dump_report_done(struct netlink_callback *cb)
@@ -488,7 +499,7 @@ static int crypto_user_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 	if ((type == (CRYPTO_MSG_GETALG - CRYPTO_MSG_BASE) &&
 	    (nlh->nlmsg_flags & NLM_F_DUMP))) {
 		struct crypto_alg *alg;
-		unsigned long dump_alloc = 0;
+		u16 dump_alloc = 0;
 
 		if (link->dump == NULL)
 			return -EINVAL;
@@ -496,16 +507,16 @@ static int crypto_user_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 		down_read(&crypto_alg_sem);
 		list_for_each_entry(alg, &crypto_alg_list, cra_list)
 			dump_alloc += CRYPTO_REPORT_MAXSIZE;
-		up_read(&crypto_alg_sem);
 
 		{
 			struct netlink_dump_control c = {
 				.dump = link->dump,
 				.done = link->done,
-				.min_dump_alloc = min(dump_alloc, 65535UL),
+				.min_dump_alloc = dump_alloc,
 			};
 			err = netlink_dump_start(crypto_nlsk, skb, nlh, &c);
 		}
+		up_read(&crypto_alg_sem);
 
 		return err;
 	}
