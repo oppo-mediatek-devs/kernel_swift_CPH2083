@@ -58,6 +58,9 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/ipi.h>
 
+#ifdef CONFIG_MTK_SCHED_MONITOR
+#include "mtk_sched_mon.h"
+#endif
 DEFINE_PER_CPU_READ_MOSTLY(int, cpu_number);
 EXPORT_PER_CPU_SYMBOL(cpu_number);
 
@@ -139,7 +142,6 @@ static int boot_secondary(unsigned int cpu, struct task_struct *idle)
 }
 
 static DECLARE_COMPLETION(cpu_running);
-bool va52mismatch __ro_after_init;
 
 int __cpu_up(unsigned int cpu, struct task_struct *idle)
 {
@@ -169,15 +171,10 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
 
 		if (!cpu_online(cpu)) {
 			pr_crit("CPU%u: failed to come online\n", cpu);
-
-			if (IS_ENABLED(CONFIG_ARM64_52BIT_VA) && va52mismatch)
-				pr_crit("CPU%u: does not support 52-bit VAs\n", cpu);
-
 			ret = -EIO;
 		}
 	} else {
 		pr_err("CPU%u: failed to boot: %d\n", cpu, ret);
-		return ret;
 	}
 
 	secondary_data.task = NULL;
@@ -216,7 +213,7 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
  * This is the secondary CPU boot entry.  We're using this CPUs
  * idle thread stack, but a set of temporary page tables.
  */
-asmlinkage notrace void secondary_start_kernel(void)
+asmlinkage void secondary_start_kernel(void)
 {
 	struct mm_struct *mm = &init_mm;
 	unsigned int cpu;
@@ -267,8 +264,9 @@ asmlinkage notrace void secondary_start_kernel(void)
 	 * the CPU migration code to notice that the CPU is online
 	 * before we continue.
 	 */
-	pr_info("CPU%u: Booted secondary processor [%08x]\n",
+	/* pr_info("CPU%u: Booted secondary processor [%08x]\n",
 					 cpu, read_cpuid_id());
+	 */
 	update_cpu_boot_status(CPU_BOOT_SUCCESS);
 	set_cpu_online(cpu, true);
 	complete(&cpu_running);
@@ -313,6 +311,18 @@ int __cpu_disable(void)
 	ret = op_cpu_disable(cpu);
 	if (ret)
 		return ret;
+
+#ifdef CONFIG_MTK_GIC_TARGET_ALL
+	{
+		unsigned long flags;
+
+		/*
+		 * we disable irq here to ensure target all feature
+		 * did not bother this cpu after status as offline
+		 */
+		local_irq_save(flags);
+	}
+#endif
 
 	/*
 	 * Take this CPU offline.  Once we clear this, we can't return,
@@ -853,20 +863,38 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
 
 	case IPI_CALL_FUNC:
 		irq_enter();
+#ifdef CONFIG_MTK_SCHED_MONITOR
+		mt_trace_IPI_start(ipinr);
+#endif
 		generic_smp_call_function_interrupt();
+#ifdef CONFIG_MTK_SCHED_MONITOR
+		mt_trace_IPI_end(ipinr);
+#endif
 		irq_exit();
 		break;
 
 	case IPI_CPU_STOP:
 		irq_enter();
+#ifdef CONFIG_MTK_SCHED_MONITOR
+		mt_trace_IPI_start(ipinr);
+#endif
 		ipi_cpu_stop(cpu);
+#ifdef CONFIG_MTK_SCHED_MONITOR
+		mt_trace_IPI_end(ipinr);
+#endif
 		irq_exit();
 		break;
 
 #ifdef CONFIG_GENERIC_CLOCKEVENTS_BROADCAST
 	case IPI_TIMER:
 		irq_enter();
+#ifdef CONFIG_MTK_SCHED_MONITOR
+		mt_trace_IPI_start(ipinr);
+#endif
 		tick_receive_broadcast();
+#ifdef CONFIG_MTK_SCHED_MONITOR
+		mt_trace_IPI_end(ipinr);
+#endif
 		irq_exit();
 		break;
 #endif
@@ -874,7 +902,13 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
 #ifdef CONFIG_IRQ_WORK
 	case IPI_IRQ_WORK:
 		irq_enter();
+#ifdef CONFIG_MTK_SCHED_MONITOR
+		mt_trace_IPI_start(ipinr);
+#endif
 		irq_work_run();
+#ifdef CONFIG_MTK_SCHED_MONITOR
+		mt_trace_IPI_end(ipinr);
+#endif
 		irq_exit();
 		break;
 #endif
@@ -909,22 +943,11 @@ void tick_broadcast(const struct cpumask *mask)
 }
 #endif
 
-/*
- * The number of CPUs online, not counting this CPU (which may not be
- * fully online and so not counted in num_online_cpus()).
- */
-static inline unsigned int num_other_online_cpus(void)
-{
-	unsigned int this_cpu_online = cpu_online(smp_processor_id());
-
-	return num_online_cpus() - this_cpu_online;
-}
-
 void smp_send_stop(void)
 {
 	unsigned long timeout;
 
-	if (num_other_online_cpus()) {
+	if (num_online_cpus() > 1) {
 		cpumask_t mask;
 
 		cpumask_copy(&mask, cpu_online_mask);
@@ -938,10 +961,10 @@ void smp_send_stop(void)
 
 	/* Wait up to one second for other CPUs to stop */
 	timeout = USEC_PER_SEC;
-	while (num_other_online_cpus() && timeout--)
+	while (num_online_cpus() > 1 && timeout--)
 		udelay(1);
 
-	if (num_other_online_cpus())
+	if (num_online_cpus() > 1)
 		pr_warning("SMP: failed to stop secondary CPUs %*pbl\n",
 			   cpumask_pr_args(cpu_online_mask));
 }

@@ -13,6 +13,13 @@ obj-y				+= nommu.o
 endif
 
 obj-$(CONFIG_ARM_PTDUMP)	+= dump.o
+
+ifneq ($(CONFIG_ARM_LPAE),y)
+ifeq ($(CONFIG_ARCH_HAS_PTE_SPECIAL),y)
+obj-$(CONFIG_MMU)		+= gup.o
+endif
+endif
+
 obj-$(CONFIG_MODULES)		+= proc-syms.o
 
 obj-$(CONFIG_ALIGNMENT_TRAP)	+= alignment.o
@@ -94,7 +101,7 @@ obj-$(CONFIG_CPU_MOHAWK)	+= proc-mohawk.o
 obj-$(CONFIG_CPU_FEROCEON)	+= proc-feroceon.o
 obj-$(CONFIG_CPU_V6)		+= proc-v6.o
 obj-$(CONFIG_CPU_V6K)		+= proc-v6.o
-obj-$(CONFIG_CPU_V7)		+= proc-v7.o proc-v7-bugs.o
+obj-$(CONFIG_CPU_V7)		+= proc-v7.o
 obj-$(CONFIG_CPU_V7M)		+= proc-v7m.o
 
 AFLAGS_proc-v6.o	:=-Wa,-march=armv6
@@ -107,3 +114,7 @@ obj-$(CONFIG_CACHE_L2X0_PMU)	+= cache-l2x0-pmu.o
 obj-$(CONFIG_CACHE_XSC3L2)	+= cache-xsc3l2.o
 obj-$(CONFIG_CACHE_TAUROS2)	+= cache-tauros2.o
 obj-$(CONFIG_CACHE_UNIPHIER)	+= cache-uniphier.o
+
+KBUILD_CPPFLAGS += -Werror -I$(srctree)/drivers/misc/mediatek/include
+
+obj-$(CONFIG_MEDIATEK_SOLUTION)	+= cache-mtk-v7.o

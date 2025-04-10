@@ -5,9 +5,6 @@
 config KEXEC_CORE
 	bool
 
-config HOTPLUG_SMT
-	bool
-
 config OPROFILE
 	tristate "OProfile system profiling"
 	depends on PROFILING
@@ -839,5 +836,20 @@ config VMAP_STACK
 	  This is presently incompatible with KASAN because KASAN expects
 	  the stack to map directly to the KASAN shadow map using a formula
 	  that is incorrect if the stack is in vmalloc space.
+
+config ARCH_DMA_BITS_34
+	bool "34 DMA zone bits"
+	depends on ZONE_DMA
+	help
+	  Support 34bit physical address in DMA zone. Legacy
+	  DMA zone supports 32bit physical address (4GB). When
+	  system DRAM is larger than 4GB, the DRAM will be split
+	  into multiple zones and increases memory management
+	  overhead. If not sure, select N.
+
+config ARCH_DMA_BITS
+	int "maximum zone dma bits"
+	default 34 if ARCH_DMA_BITS_34
+	default 32
 
 source "kernel/gcov/Kconfig"

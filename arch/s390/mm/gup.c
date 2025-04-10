@@ -38,8 +38,7 @@ static inline int gup_pte_range(pmd_t *pmdp, pmd_t pmd, unsigned long addr,
 		VM_BUG_ON(!pfn_valid(pte_pfn(pte)));
 		page = pte_page(pte);
 		head = compound_head(page);
-		if (WARN_ON_ONCE(page_ref_count(head) < 0)
-		    || !page_cache_get_speculative(head))
+		if (!page_cache_get_speculative(head))
 			return 0;
 		if (unlikely(pte_val(pte) != pte_val(*ptep))) {
 			put_page(head);
@@ -77,8 +76,7 @@ static inline int gup_huge_pmd(pmd_t *pmdp, pmd_t pmd, unsigned long addr,
 		refs++;
 	} while (addr += PAGE_SIZE, addr != end);
 
-	if (WARN_ON_ONCE(page_ref_count(head) < 0)
-	    || !page_cache_add_speculative(head, refs)) {
+	if (!page_cache_add_speculative(head, refs)) {
 		*nr -= refs;
 		return 0;
 	}
@@ -152,8 +150,7 @@ static int gup_huge_pud(pud_t *pudp, pud_t pud, unsigned long addr,
 		refs++;
 	} while (addr += PAGE_SIZE, addr != end);
 
-	if (WARN_ON_ONCE(page_ref_count(head) < 0)
-	    || !page_cache_add_speculative(head, refs)) {
+	if (!page_cache_add_speculative(head, refs)) {
 		*nr -= refs;
 		return 0;
 	}
@@ -261,14 +258,7 @@ int get_user_pages_fast(unsigned long start, int nr_pages, int write,
 
 	might_sleep();
 	start &= PAGE_MASK;
-	/*
-	 * The FAST_GUP case requires FOLL_WRITE even for pure reads,
-	 * because get_user_pages() may need to cause an early COW in
-	 * order to avoid confusing the normal COW routines. So only
-	 * targets that are already writable are safe to do by just
-	 * looking at the page tables.
-	 */
-	nr = __get_user_pages_fast(start, nr_pages, 1, pages);
+	nr = __get_user_pages_fast(start, nr_pages, write, pages);
 	if (nr == nr_pages)
 		return nr;
 

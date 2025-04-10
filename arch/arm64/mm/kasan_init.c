@@ -101,7 +101,9 @@ static void __init kasan_map_early_shadow(void)
 
 asmlinkage void __init kasan_early_init(void)
 {
+#ifndef CONFIG_KASAN_ENHANCEMENT
 	BUILD_BUG_ON(KASAN_SHADOW_OFFSET != KASAN_SHADOW_END - (1UL << 61));
+#endif
 	BUILD_BUG_ON(!IS_ALIGNED(KASAN_SHADOW_START, PGDIR_SIZE));
 	BUILD_BUG_ON(!IS_ALIGNED(KASAN_SHADOW_END, PGDIR_SIZE));
 	kasan_map_early_shadow();
@@ -161,7 +163,7 @@ void __init kasan_init(void)
 	clear_pgds(KASAN_SHADOW_START, KASAN_SHADOW_END);
 
 	vmemmap_populate(kimg_shadow_start, kimg_shadow_end,
-			 pfn_to_nid(virt_to_pfn(lm_alias(_text))));
+			 pfn_to_nid(virt_to_pfn(_text)));
 
 	/*
 	 * vmemmap_populate() has populated the shadow region that covers the

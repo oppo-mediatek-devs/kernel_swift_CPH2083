@@ -548,13 +548,12 @@ int arch_validate_hwbkpt_settings(struct perf_event *bp)
 			/* Aligned */
 			break;
 		case 1:
+			/* Allow single byte watchpoint. */
+			if (info->ctrl.len == ARM_BREAKPOINT_LEN_1)
+				break;
 		case 2:
 			/* Allow halfword watchpoints and breakpoints. */
 			if (info->ctrl.len == ARM_BREAKPOINT_LEN_2)
-				break;
-		case 3:
-			/* Allow single byte watchpoint. */
-			if (info->ctrl.len == ARM_BREAKPOINT_LEN_1)
 				break;
 		default:
 			return -EINVAL;
@@ -938,6 +937,10 @@ void hw_breakpoint_thread_switch(struct task_struct *next)
  */
 static int hw_breakpoint_reset(unsigned int cpu)
 {
+#ifdef CONFIG_MTK_WATCHPOINT
+	/* mediatek will use our own operations for hw breakpoint/watchpoint */
+	return 0;
+#endif
 	int i;
 	struct perf_event **slots;
 	/*

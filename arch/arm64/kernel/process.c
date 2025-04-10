@@ -58,7 +58,7 @@
 
 #ifdef CONFIG_CC_STACKPROTECTOR
 #include <linux/stackprotector.h>
-unsigned long __stack_chk_guard __ro_after_init;
+unsigned long __stack_chk_guard __read_mostly;
 EXPORT_SYMBOL(__stack_chk_guard);
 #endif
 
@@ -180,10 +180,10 @@ static void show_data(unsigned long addr, int nbytes, const char *name)
 	 * don't attempt to dump non-kernel addresses or
 	 * values that are probably just small negative numbers
 	 */
-	if (addr < PAGE_OFFSET || addr > -256UL)
+	if (!pfn_valid(__pa(addr) >> PAGE_SHIFT) || addr > -256UL)
 		return;
 
-	printk("\n%s: %pS:\n", name, addr);
+	printk("\n%s: %#lx:\n", name, addr);
 
 	/*
 	 * round address down to a 32 bit boundary
@@ -486,3 +486,45 @@ unsigned long arch_randomize_brk(struct mm_struct *mm)
 	else
 		return randomize_page(mm->brk, 0x40000000);
 }
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_ELSA_STUB)
+//zhoumingjun@Swdp.shanghai, 2017/04/19, add process_event_notifier support
+static BLOCKING_NOTIFIER_HEAD(process_event_notifier);
+
+int process_event_register_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&process_event_notifier, nb);
+}
+EXPORT_SYMBOL(process_event_register_notifier);
+
+int process_event_unregister_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&process_event_notifier, nb);
+}
+EXPORT_SYMBOL(process_event_unregister_notifier);
+
+int process_event_notifier_call_chain(unsigned long action, struct process_event_data *pe_data)
+{
+	return blocking_notifier_call_chain(&process_event_notifier, action, pe_data);
+}
+
+//zhoumingjun@Swdp.shanghai, 2017/07/06, add process_event_notifier_atomic support
+static ATOMIC_NOTIFIER_HEAD(process_event_notifier_atomic);
+
+int process_event_register_notifier_atomic(struct notifier_block *nb)
+{
+	return atomic_notifier_chain_register(&process_event_notifier_atomic, nb);
+}
+EXPORT_SYMBOL(process_event_register_notifier_atomic);
+
+int process_event_unregister_notifier_atomic(struct notifier_block *nb)
+{
+	return atomic_notifier_chain_unregister(&process_event_notifier_atomic, nb);
+}
+EXPORT_SYMBOL(process_event_unregister_notifier_atomic);
+
+int process_event_notifier_call_chain_atomic(unsigned long action, struct process_event_data *pe_data)
+{
+	return atomic_notifier_call_chain(&process_event_notifier_atomic, action, pe_data);
+}
+#endif

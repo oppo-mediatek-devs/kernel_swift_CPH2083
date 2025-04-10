@@ -132,6 +132,9 @@ flush_levels:
 #ifdef CONFIG_PREEMPT
 	save_and_disable_irqs_notrace r9	@ make cssr&csidr read atomic
 #endif
+#ifdef CONFIG_ARM_ERRATA_814220
+	dsb
+#endif
 	mcr	p15, 2, r10, c0, c0, 0		@ select current cache level in cssr
 	isb					@ isb to sych the new cssr&csidr
 	mrc	p15, 1, r1, c0, c0, 0		@ read the new csidr
@@ -278,7 +281,11 @@ ENTRY(v7_coherent_user_range)
 	ALT_UP(W(nop))
 #endif
 1:
+#if defined(CONFIG_ARM_ERRATA_855873) || defined(CONFIG_ARM_ERRATA_824069)
+ USER(	mcr	p15, 0, r12, c7, c14, 1	)	@ clean D line to the point of unification
+#else
  USER(	mcr	p15, 0, r12, c7, c11, 1	)	@ clean D line to the point of unification
+#endif
 	add	r12, r12, r2
 	cmp	r12, r1
 	blo	1b
@@ -359,16 +366,14 @@ v7_dma_inv_range:
 	ALT_UP(W(nop))
 #endif
 	mcrne	p15, 0, r0, c7, c14, 1		@ clean & invalidate D / U line
-	addne	r0, r0, r2
 
 	tst	r1, r3
 	bic	r1, r1, r3
 	mcrne	p15, 0, r1, c7, c14, 1		@ clean & invalidate D / U line
-	cmp	r0, r1
 1:
-	mcrlo	p15, 0, r0, c7, c6, 1		@ invalidate D / U line
-	addlo	r0, r0, r2
-	cmplo	r0, r1
+	mcr	p15, 0, r0, c7, c6, 1		@ invalidate D / U line
+	add	r0, r0, r2
+	cmp	r0, r1
 	blo	1b
 	dsb	st
 	ret	lr
@@ -388,7 +393,11 @@ v7_dma_clean_range:
 	ALT_UP(W(nop))
 #endif
 1:
+#if defined(CONFIG_ARM_ERRATA_855873) || defined(CONFIG_ARM_ERRATA_824069)
+	mcr	p15, 0, r0, c7, c14, 1		@ clean and invalidate D / U line
+#else
 	mcr	p15, 0, r0, c7, c10, 1		@ clean D / U line
+#endif
 	add	r0, r0, r2
 	cmp	r0, r1
 	blo	1b

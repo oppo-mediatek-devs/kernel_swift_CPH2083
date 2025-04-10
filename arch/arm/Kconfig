@@ -9,6 +9,7 @@ config ARM
 	select ARCH_HAS_GCOV_PROFILE_ALL
 	select ARCH_MIGHT_HAVE_PC_PARPORT
 	select ARCH_SUPPORTS_ATOMIC_RMW
+	select ARCH_HAS_PTE_SPECIAL if (ARM_LPAE || CPU_V7 || CPU_V7M || CPU_V6 || CPUV6K)
 	select ARCH_USE_BUILTIN_BSWAP
 	select ARCH_USE_CMPXCHG_LOCKREF
 	select ARCH_WANT_IPC_PARSE_VERSION
@@ -55,7 +56,6 @@ config ARM
 	select HAVE_FTRACE_MCOUNT_RECORD if (!XIP_KERNEL)
 	select HAVE_FUNCTION_GRAPH_TRACER if (!THUMB2_KERNEL)
 	select HAVE_FUNCTION_TRACER if (!XIP_KERNEL)
-	select HAVE_FUTEX_CMPXCHG if FUTEX
 	select HAVE_GCC_PLUGINS
 	select HAVE_GENERIC_DMA_COHERENT
 	select HAVE_HW_BREAKPOINT if (PERF_EVENTS && (CPU_V6 || CPU_V6K || CPU_V7))
@@ -602,9 +602,7 @@ config ARCH_S3C24XX
 	select HAVE_S3C_RTC if RTC_CLASS
 	select MULTI_IRQ_HANDLER
 	select NEED_MACH_IO_H
-	select S3C2410_WATCHDOG
 	select SAMSUNG_ATAGS
-	select WATCHDOG
 	help
 	  Samsung S3C2410, S3C2412, S3C2413, S3C2416, S3C2440, S3C2442, S3C2443
 	  and S3C2450 SoCs based systems, such as the Simtec Electronics BAST
@@ -1176,6 +1174,19 @@ config ARM_ERRATA_773022
 	  loop buffer may deliver incorrect instructions. This
 	  workaround disables the loop buffer to avoid the erratum.
 
+config ARM_ERRATA_814220
+	bool "ARM errata: L2 cache maintenance operation can overtake a L1 cache maintenance operation"
+	depends on CPU_V7
+	help
+	  This option enables the workaround for erratum 814220
+	  Code that intends to clean dirty data from L1 to L2 and then
+	  from L2 to L3 using set/way operations might not behave as
+	  expected. The L2 to L3 operation might happen first and
+	  result in dirty data remaining in L2 after the L1 to L2
+	  operation has completed.
+
+	  This workaround put a DSB before changing cache levels
+
 config ARM_ERRATA_818325_852422
 	bool "ARM errata: A12: some seqs of opposed cond code instrs => deadlock or corruption"
 	depends on CPU_V7
@@ -1229,6 +1240,24 @@ config ARM_ERRATA_852423
 	  This is identical to Cortex-A12 erratum 852422.  It is a separate
 	  config option from the A12 erratum due to the way errata are checked
 	  for and handled.
+
+config ARM_ERRATA_855873
+	bool "ARM errata: An eviction might overtake a cache clean operation"
+	help
+	  This option enables the workaround for the 855873 Cortex-A53
+	  (up to r0p4) erratum. Because of this erratum, the processor
+	  might issue an eviction and an L2 cache clean operation to
+	  the interconnect in the wrong order.
+
+config ARM_ERRATA_824069
+	bool "ARM errata: Cache line might not be marked as clean after a CleanShared snoop"
+	help
+	  This option enables the workaround for the 824069 Cortex-A53
+	  (up to r0p2) erratum. If a Cortex-A53 processor is executing
+	  a store or PLDW instruction at the same time as a processor
+	  in another cluster is executing a cache maintenance operation
+	  to the same address, then this erratum might cause
+	  a clean cache line to be incorrectly marked as dirty.
 
 endmenu
 
@@ -1460,7 +1489,6 @@ config NR_CPUS
 config HOTPLUG_CPU
 	bool "Support for hot-pluggable CPUs"
 	depends on SMP
-	select GENERIC_IRQ_MIGRATION
 	help
 	  Say Y here to experiment with turning CPUs off and on.  CPUs
 	  can be controlled through /sys/devices/system/cpu.
@@ -1510,12 +1538,15 @@ choice
 	prompt "Timer frequency"
 
 config HZ_100
+	depends on !MTK_ENABLE_AGO
 	bool "100 Hz"
 
 config HZ_200
+	depends on !MTK_ENABLE_AGO
 	bool "200 Hz"
 
 config HZ_250
+	depends on !MTK_ENABLE_AGO
 	bool "250 Hz"
 
 config HZ_300
@@ -1547,10 +1578,12 @@ config THUMB2_KERNEL
 	depends on (CPU_V7 || CPU_V7M) && !CPU_V6 && !CPU_V6K
 	default y if CPU_THUMBONLY
 	select AEABI
+	select ARM_ASM_UNIFIED
 	select ARM_UNWIND
 	help
 	  By enabling this option, the kernel will be compiled in
-	  Thumb-2 mode.
+	  Thumb-2 mode. A compiler/assembler that understand the unified
+	  ARM-Thumb syntax is needed.
 
 	  If unsure, say N.
 
@@ -1584,6 +1617,9 @@ config THUMB2_AVOID_R_ARM_THM_JUMP11
 	  Only Thumb-2 kernels are affected.
 
 	  Unless you are sure your tools don't have this problem, say Y.
+
+config ARM_ASM_UNIFIED
+	bool
 
 config ARM_PATCH_IDIV
 	bool "Runtime patch udiv/sdiv instructions into __aeabi_{u}idiv()"
@@ -1887,6 +1923,22 @@ config BUILD_ARM_APPENDED_DTB_IMAGE_NAMES
 	  Space separated list of names of dtbs to append when
 	  building a concatenated zImage-dtb.
 
+config BUILD_ARM_DTB_OVERLAY_IMAGE
+	bool "Build a device tree overlay image"
+	depends on OF
+	help
+	  Enabling this option will casue overlay device tree
+	  to be built by default.
+	  Overlay DT contains device-specific configurations.
+	  Please be aware that bootloader supports DT merging.
+
+config BUILD_ARM_DTB_OVERLAY_IMAGE_NAMES
+	string "Default dtb overlay names"
+	depends on BUILD_ARM_DTB_OVERLAY_IMAGE
+	help
+	  Space separated list of names of dtbs to append when
+	  building a concatenated overlay image
+
 # Compressed boot loader in ROM.  Yes, we really want to ask about
 # TEXT and BSS so we preserve their values in the config files.
 config ZBOOT_ROM_TEXT
@@ -2042,7 +2094,7 @@ config XIP_PHYS_ADDR
 config KEXEC
 	bool "Kexec system call (EXPERIMENTAL)"
 	depends on (!SMP || PM_SLEEP_SMP)
-	depends on MMU
+	depends on !CPU_V7M
 	select KEXEC_CORE
 	help
 	  kexec is a system call that implements the ability to shutdown your
