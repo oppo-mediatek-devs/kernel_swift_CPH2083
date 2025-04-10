@@ -73,7 +73,6 @@
 #include <net/icmp.h>
 #include <net/checksum.h>
 #include <net/inetpeer.h>
-#include <net/inet_ecn.h>
 #include <net/lwtunnel.h>
 #include <linux/bpf-cgroup.h>
 #include <linux/igmp.h>
@@ -82,10 +81,11 @@
 #include <linux/netlink.h>
 #include <linux/tcp.h>
 
-static int
-ip_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
-	    unsigned int mtu,
-	    int (*output)(struct net *, struct sock *, struct sk_buff *));
+#ifdef CONFIG_MTK_MIX_DEVICES
+void inject_mix_event(struct sk_buff *skb,
+		      struct net_device *dev,
+		      struct iphdr *iph);
+#endif
 
 /* Generate a checksum for an outgoing IP datagram. */
 void ip_send_check(struct iphdr *iph)
@@ -308,7 +308,7 @@ static int ip_finish_output(struct net *net, struct sock *sk, struct sk_buff *sk
 	if (skb_is_gso(skb))
 		return ip_finish_output_gso(net, sk, skb, mtu);
 
-	if (skb->len > mtu || IPCB(skb)->frag_max_size)
+	if (skb->len > mtu || (IPCB(skb)->flags & IPSKB_FRAG_PMTU))
 		return ip_fragment(net, sk, skb, mtu, ip_finish_output2);
 
 	return ip_finish_output2(net, sk, skb);
@@ -399,6 +399,13 @@ int ip_output(struct net *net, struct sock *sk, struct sk_buff *skb)
 	skb->dev = dev;
 	skb->protocol = htons(ETH_P_IP);
 
+#ifdef CONFIG_MTK_MIX_DEVICES
+	if (skb->sk && dev)
+		inject_mix_event(skb,
+				 dev,
+				 ip_hdr(skb));
+#endif
+
 	return NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING,
 			    net, sk, skb, NULL, dev,
 			    ip_finish_output,
@@ -415,9 +422,8 @@ static void ip_copy_addrs(struct iphdr *iph, const struct flowi4 *fl4)
 {
 	BUILD_BUG_ON(offsetof(typeof(*fl4), daddr) !=
 		     offsetof(typeof(*fl4), saddr) + sizeof(fl4->saddr));
-
-	iph->saddr = fl4->saddr;
-	iph->daddr = fl4->daddr;
+	memcpy(&iph->saddr, &fl4->saddr,
+	       sizeof(fl4->saddr) + sizeof(fl4->daddr));
 }
 
 /* Note: skb->sk can be different from sk, in case of tunnels */
@@ -516,7 +522,6 @@ static void ip_copy_metadata(struct sk_buff *to, struct sk_buff *from)
 	to->pkt_type = from->pkt_type;
 	to->priority = from->priority;
 	to->protocol = from->protocol;
-	to->skb_iif = from->skb_iif;
 	skb_dst_drop(to);
 	skb_dst_copy(to, from);
 	to->dev = from->dev;
@@ -537,9 +542,9 @@ static void ip_copy_metadata(struct sk_buff *to, struct sk_buff *from)
 	skb_copy_secmark(to, from);
 }
 
-static int ip_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
-		       unsigned int mtu,
-		       int (*output)(struct net *, struct sock *, struct sk_buff *))
+int ip_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
+		unsigned int mtu,
+		int (*output)(struct net *, struct sock *, struct sk_buff *))
 {
 	struct iphdr *iph = ip_hdr(skb);
 
@@ -1183,17 +1188,13 @@ static int ip_setup_cork(struct sock *sk, struct inet_cork *cork,
 	rt = *rtp;
 	if (unlikely(!rt))
 		return -EFAULT;
-
-	cork->fragsize = ip_sk_use_pmtu(sk) ?
-			 dst_mtu(&rt->dst) : READ_ONCE(rt->dst.dev->mtu);
-
-	if (!inetdev_valid_mtu(cork->fragsize))
-		return -ENETUNREACH;
-
-	cork->dst = &rt->dst;
-	/* We stole this route, caller should not release it. */
+	/*
+	 * We steal reference to this route, caller should not release it
+	 */
 	*rtp = NULL;
-
+	cork->fragsize = ip_sk_use_pmtu(sk) ?
+			 dst_mtu(&rt->dst) : rt->dst.dev->mtu;
+	cork->dst = &rt->dst;
 	cork->length = 0;
 	cork->ttl = ipc->ttl;
 	cork->tos = ipc->tos;
@@ -1636,7 +1637,7 @@ void ip_send_unicast_reply(struct sock *sk, struct sk_buff *skb,
 	if (IS_ERR(rt))
 		return;
 
-	inet_sk(sk)->tos = arg->tos & ~INET_ECN_MASK;
+	inet_sk(sk)->tos = arg->tos;
 
 	sk->sk_priority = skb->priority;
 	sk->sk_protocol = ip_hdr(skb)->protocol;

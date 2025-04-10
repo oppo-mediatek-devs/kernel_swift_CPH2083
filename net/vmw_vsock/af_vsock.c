@@ -97,7 +97,6 @@
 #include <linux/mutex.h>
 #include <linux/net.h>
 #include <linux/poll.h>
-#include <linux/random.h>
 #include <linux/skbuff.h>
 #include <linux/smp.h>
 #include <linux/socket.h>
@@ -449,14 +448,14 @@ static int vsock_send_shutdown(struct sock *sk, int mode)
 	return transport->shutdown(vsock_sk(sk), mode);
 }
 
-static void vsock_pending_work(struct work_struct *work)
+void vsock_pending_work(struct work_struct *work)
 {
 	struct sock *sk;
 	struct sock *listener;
 	struct vsock_sock *vsk;
 	bool cleanup;
 
-	vsk = container_of(work, struct vsock_sock, pending_work.work);
+	vsk = container_of(work, struct vsock_sock, dwork.work);
 	sk = sk_vsock(vsk);
 	listener = vsk->listener;
 	cleanup = true;
@@ -496,18 +495,15 @@ out:
 	sock_put(sk);
 	sock_put(listener);
 }
+EXPORT_SYMBOL_GPL(vsock_pending_work);
 
 /**** SOCKET OPERATIONS ****/
 
 static int __vsock_bind_stream(struct vsock_sock *vsk,
 			       struct sockaddr_vm *addr)
 {
-	static u32 port = 0;
+	static u32 port = LAST_RESERVED_PORT + 1;
 	struct sockaddr_vm new_addr;
-
-	if (!port)
-		port = LAST_RESERVED_PORT + 1 +
-			prandom_u32_max(U32_MAX - LAST_RESERVED_PORT);
 
 	vsock_addr_init(&new_addr, addr->svm_cid, addr->svm_port);
 
@@ -598,8 +594,6 @@ static int __vsock_bind(struct sock *sk, struct sockaddr_vm *addr)
 	return retval;
 }
 
-static void vsock_connect_timeout(struct work_struct *work);
-
 struct sock *__vsock_create(struct net *net,
 			    struct socket *sock,
 			    struct sock *parent,
@@ -642,17 +636,14 @@ struct sock *__vsock_create(struct net *net,
 	vsk->sent_request = false;
 	vsk->ignore_connecting_rst = false;
 	vsk->peer_shutdown = 0;
-	INIT_DELAYED_WORK(&vsk->connect_work, vsock_connect_timeout);
-	INIT_DELAYED_WORK(&vsk->pending_work, vsock_pending_work);
 
 	psk = parent ? vsock_sk(parent) : NULL;
 	if (parent) {
 		vsk->trusted = psk->trusted;
 		vsk->owner = get_cred(psk->owner);
 		vsk->connect_timeout = psk->connect_timeout;
-		security_sk_clone(parent, sk);
 	} else {
-		vsk->trusted = ns_capable_noaudit(&init_user_ns, CAP_NET_ADMIN);
+		vsk->trusted = capable(CAP_NET_ADMIN);
 		vsk->owner = get_current_cred();
 		vsk->connect_timeout = VSOCK_DEFAULT_CONNECT_TIMEOUT;
 	}
@@ -831,12 +822,10 @@ static int vsock_shutdown(struct socket *sock, int mode)
 	 */
 
 	sk = sock->sk;
-
-	lock_sock(sk);
 	if (sock->state == SS_UNCONNECTED) {
 		err = -ENOTCONN;
 		if (sk->sk_type == SOCK_STREAM)
-			goto out;
+			return err;
 	} else {
 		sock->state = SS_DISCONNECTING;
 		err = 0;
@@ -845,8 +834,10 @@ static int vsock_shutdown(struct socket *sock, int mode)
 	/* Receive and send shutdowns are treated alike. */
 	mode = mode & (RCV_SHUTDOWN | SEND_SHUTDOWN);
 	if (mode) {
+		lock_sock(sk);
 		sk->sk_shutdown |= mode;
 		sk->sk_state_change(sk);
+		release_sock(sk);
 
 		if (sk->sk_type == SOCK_STREAM) {
 			sock_reset_flag(sk, SOCK_DONE);
@@ -854,8 +845,6 @@ static int vsock_shutdown(struct socket *sock, int mode)
 		}
 	}
 
-out:
-	release_sock(sk);
 	return err;
 }
 
@@ -1124,8 +1113,9 @@ static void vsock_connect_timeout(struct work_struct *work)
 {
 	struct sock *sk;
 	struct vsock_sock *vsk;
+	int cancel = 0;
 
-	vsk = container_of(work, struct vsock_sock, connect_work.work);
+	vsk = container_of(work, struct vsock_sock, dwork.work);
 	sk = sk_vsock(vsk);
 
 	lock_sock(sk);
@@ -1134,9 +1124,11 @@ static void vsock_connect_timeout(struct work_struct *work)
 		sk->sk_state = SS_UNCONNECTED;
 		sk->sk_err = ETIMEDOUT;
 		sk->sk_error_report(sk);
-		vsock_transport_cancel_pkt(vsk);
+		cancel = 1;
 	}
 	release_sock(sk);
+	if (cancel)
+		vsock_transport_cancel_pkt(vsk);
 
 	sock_put(sk);
 }
@@ -1173,8 +1165,6 @@ static int vsock_stream_connect(struct socket *sock, struct sockaddr *addr,
 		 * non-blocking call.
 		 */
 		err = -EALREADY;
-		if (flags & O_NONBLOCK)
-			goto out;
 		break;
 	default:
 		if ((sk->sk_state == VSOCK_SS_LISTEN) ||
@@ -1229,7 +1219,9 @@ static int vsock_stream_connect(struct socket *sock, struct sockaddr *addr,
 			 * timeout fires.
 			 */
 			sock_hold(sk);
-			schedule_delayed_work(&vsk->connect_work, timeout);
+			INIT_DELAYED_WORK(&vsk->dwork,
+					  vsock_connect_timeout);
+			schedule_delayed_work(&vsk->dwork, timeout);
 
 			/* Skip ahead to preserve error code set above. */
 			goto out_wait;
@@ -1298,7 +1290,7 @@ static int vsock_accept(struct socket *sock, struct socket *newsock, int flags)
 	/* Wait for children sockets to appear; these are the new sockets
 	 * created upon connection establishment.
 	 */
-	timeout = sock_rcvtimeo(listener, flags & O_NONBLOCK);
+	timeout = sock_sndtimeo(listener, flags & O_NONBLOCK);
 	prepare_to_wait(sk_sleep(listener), &wait, TASK_INTERRUPTIBLE);
 
 	while ((connected = vsock_dequeue_accept(listener)) == NULL &&

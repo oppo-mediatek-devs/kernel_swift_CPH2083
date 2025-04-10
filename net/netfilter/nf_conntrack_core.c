@@ -25,7 +25,6 @@
 #include <linux/slab.h>
 #include <linux/random.h>
 #include <linux/jhash.h>
-#include <linux/siphash.h>
 #include <linux/err.h>
 #include <linux/percpu.h>
 #include <linux/moduleparam.h>
@@ -302,40 +301,6 @@ nf_ct_invert_tuple(struct nf_conntrack_tuple *inverse,
 }
 EXPORT_SYMBOL_GPL(nf_ct_invert_tuple);
 
-/* Generate a almost-unique pseudo-id for a given conntrack.
- *
- * intentionally doesn't re-use any of the seeds used for hash
- * table location, we assume id gets exposed to userspace.
- *
- * Following nf_conn items do not change throughout lifetime
- * of the nf_conn:
- *
- * 1. nf_conn address
- * 2. nf_conn->master address (normally NULL)
- * 3. the associated net namespace
- * 4. the original direction tuple
- */
-u32 nf_ct_get_id(const struct nf_conn *ct)
-{
-	static __read_mostly siphash_key_t ct_id_seed;
-	unsigned long a, b, c, d;
-
-	net_get_random_once(&ct_id_seed, sizeof(ct_id_seed));
-
-	a = (unsigned long)ct;
-	b = (unsigned long)ct->master;
-	c = (unsigned long)nf_ct_net(ct);
-	d = (unsigned long)siphash(&ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
-				   sizeof(ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple),
-				   &ct_id_seed);
-#ifdef CONFIG_64BIT
-	return siphash_4u64((u64)a, (u64)b, (u64)c, (u64)d, &ct_id_seed);
-#else
-	return siphash_4u32((u32)a, (u32)b, (u32)c, (u32)d, &ct_id_seed);
-#endif
-}
-EXPORT_SYMBOL_GPL(nf_ct_get_id);
-
 static void
 clean_from_lists(struct nf_conn *ct)
 {
@@ -491,13 +456,8 @@ bool nf_ct_delete(struct nf_conn *ct, u32 portid, int report)
 		return false;
 
 	tstamp = nf_conn_tstamp_find(ct);
-	if (tstamp) {
-		s32 timeout = ct->timeout - nfct_time_stamp;
-
+	if (tstamp && tstamp->stop == 0)
 		tstamp->stop = ktime_get_real_ns();
-		if (timeout < 0)
-			tstamp->stop -= jiffies_to_nsecs(-timeout);
-	}
 
 	if (nf_conntrack_event_report(IPCT_DESTROY, ct,
 				    portid, report) < 0) {
@@ -895,23 +855,6 @@ nf_conntrack_tuple_taken(const struct nf_conntrack_tuple *tuple,
 		}
 
 		if (nf_ct_key_equal(h, tuple, zone, net)) {
-			/* Tuple is taken already, so caller will need to find
-			 * a new source port to use.
-			 *
-			 * Only exception:
-			 * If the *original tuples* are identical, then both
-			 * conntracks refer to the same flow.
-			 * This is a rare situation, it can occur e.g. when
-			 * more than one UDP packet is sent from same socket
-			 * in different threads.
-			 *
-			 * Let nf_ct_resolve_clash() deal with this later.
-			 */
-			if (nf_ct_tuple_equal(&ignored_conntrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
-					      &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple) &&
-					      nf_ct_zone_equal(ct, zone, IP_CT_DIR_ORIGINAL))
-				continue;
-
 			NF_CT_STAT_INC_ATOMIC(net, found);
 			rcu_read_unlock();
 			return 1;
@@ -975,22 +918,19 @@ static unsigned int early_drop_list(struct net *net,
 	return drops;
 }
 
-static noinline int early_drop(struct net *net, unsigned int hash)
+static noinline int early_drop(struct net *net, unsigned int _hash)
 {
-	unsigned int i, bucket;
+	unsigned int i;
 
 	for (i = 0; i < NF_CT_EVICTION_RANGE; i++) {
 		struct hlist_nulls_head *ct_hash;
-		unsigned int hsize, drops;
+		unsigned int hash, hsize, drops;
 
 		rcu_read_lock();
 		nf_conntrack_get_ht(&ct_hash, &hsize);
-		if (!i)
-			bucket = reciprocal_scale(hash, hsize);
-		else
-			bucket = (bucket + 1) % hsize;
+		hash = reciprocal_scale(_hash++, hsize);
 
-		drops = early_drop_list(net, &ct_hash[bucket]);
+		drops = early_drop_list(net, &ct_hash[hash]);
 		rcu_read_unlock();
 
 		if (drops) {
@@ -1088,7 +1028,7 @@ static void gc_worker(struct work_struct *work)
 
 static void conntrack_gc_work_init(struct conntrack_gc_work *gc_work)
 {
-	INIT_DELAYED_WORK(&gc_work->dwork, gc_worker);
+	INIT_DEFERRABLE_WORK(&gc_work->dwork, gc_worker);
 	gc_work->next_gc_run = HZ;
 	gc_work->exiting = false;
 }
@@ -1130,9 +1070,9 @@ __nf_conntrack_alloc(struct net *net,
 	*(unsigned long *)(&ct->tuplehash[IP_CT_DIR_REPLY].hnnode.pprev) = hash;
 	ct->status = 0;
 	write_pnet(&ct->ct_net, net);
-	memset(&ct->__nfct_init_offset, 0,
+	memset(&ct->__nfct_init_offset[0], 0,
 	       offsetof(struct nf_conn, proto) -
-	       offsetof(struct nf_conn, __nfct_init_offset));
+	       offsetof(struct nf_conn, __nfct_init_offset[0]));
 
 	nf_ct_zone_add(ct, zone);
 
@@ -1882,7 +1822,7 @@ int nf_conntrack_set_hashsize(const char *val, const struct kernel_param *kp)
 		return -EOPNOTSUPP;
 
 	/* On boot, we can set this without any fancy locking. */
-	if (!nf_conntrack_hash)
+	if (!nf_conntrack_htable_size)
 		return param_set_uint(val, kp);
 
 	rc = kstrtouint(val, 0, &hashsize);
