@@ -103,7 +103,30 @@ struct nf_conn {
 	struct hlist_node	nat_bysource;
 #endif
 	/* all members below initialized via memset */
-	struct { } __nfct_init_offset;
+	u8 __nfct_init_offset[0];
+
+	//#ifdef VENDOR_EDIT
+	//Junyuan.Huang@PSW.CN.WiFi.Network.internet.1197891, 2018/04/10,
+	//Add code for appo sla function
+	u32 oppo_game_skb_len;
+	u32 oppo_game_detect_status;
+	u32 oppo_game_time_interval;
+	u32 oppo_game_up_count;
+	u32 oppo_game_down_count;
+	u32 oppo_game_lost_count;
+	u32 oppo_game_same_count;
+	u32 oppo_http_flag;
+	u32 oppo_skb_count;
+	int oppo_app_type;
+	s64 oppo_game_timestamp;
+	s64 oppo_game_last_timestamp;
+	//#endif /* VENDOR_EDIT */
+
+	#ifdef VENDOR_EDIT
+	//Yuan.Huang@PSW.CN.WiFi.Network.internet.1461349, 2018/06/18,
+	//Add for WeChat lucky money recognition
+	u32 oppo_app_uid;
+	#endif /* VENDOR_EDIT */
 
 	/* If we were expected by an expectation, this will be it */
 	struct nf_conn *master;
@@ -335,8 +358,6 @@ struct nf_conn *nf_ct_tmpl_alloc(struct net *net,
 				 const struct nf_conntrack_zone *zone,
 				 gfp_t flags);
 void nf_ct_tmpl_free(struct nf_conn *tmpl);
-
-u32 nf_ct_get_id(const struct nf_conn *ct);
 
 #define NF_CT_STAT_INC(net, count)	  __this_cpu_inc((net)->ct.stat->count)
 #define NF_CT_STAT_INC_ATOMIC(net, count) this_cpu_inc((net)->ct.stat->count)

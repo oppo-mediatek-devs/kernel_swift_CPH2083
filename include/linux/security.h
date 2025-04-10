@@ -1,5 +1,5 @@
 /*
- * Linux Security plug
+* Linux Security plug
  *
  * Copyright (C) 2001 WireX Communications, Inc <chris@wirex.com>
  * Copyright (C) 2001 Greg Kroah-Hartman <greg@kroah.com>
@@ -184,13 +184,13 @@ static inline void security_free_mnt_opts(struct security_mnt_opts *opts)
 extern int security_init(void);
 
 /* Security operations */
-int security_binder_set_context_mgr(const struct cred *mgr);
-int security_binder_transaction(const struct cred *from,
-				const struct cred *to);
-int security_binder_transfer_binder(const struct cred *from,
-				    const struct cred *to);
-int security_binder_transfer_file(const struct cred *from,
-				  const struct cred *to, struct file *file);
+int security_binder_set_context_mgr(struct task_struct *mgr);
+int security_binder_transaction(struct task_struct *from,
+				struct task_struct *to);
+int security_binder_transfer_binder(struct task_struct *from,
+				    struct task_struct *to);
+int security_binder_transfer_file(struct task_struct *from,
+				  struct task_struct *to, struct file *file);
 int security_ptrace_access_check(struct task_struct *child, unsigned int mode);
 int security_ptrace_traceme(struct task_struct *parent);
 int security_capget(struct task_struct *target,
@@ -394,25 +394,25 @@ static inline int security_init(void)
 	return 0;
 }
 
-static inline int security_binder_set_context_mgr(const struct cred *mgr)
+static inline int security_binder_set_context_mgr(struct task_struct *mgr)
 {
 	return 0;
 }
 
-static inline int security_binder_transaction(const struct cred *from,
-					      const struct cred *to)
+static inline int security_binder_transaction(struct task_struct *from,
+					      struct task_struct *to)
 {
 	return 0;
 }
 
-static inline int security_binder_transfer_binder(const struct cred *from,
-						  const struct cred *to)
+static inline int security_binder_transfer_binder(struct task_struct *from,
+						  struct task_struct *to)
 {
 	return 0;
 }
 
-static inline int security_binder_transfer_file(const struct cred *from,
-						const struct cred *to,
+static inline int security_binder_transfer_file(struct task_struct *from,
+						struct task_struct *to,
 						struct file *file)
 {
 	return 0;
@@ -1732,6 +1732,4 @@ static inline char *alloc_secdata(void)
 static inline void free_secdata(void *secdata)
 { }
 #endif /* CONFIG_SECURITY */
-
 #endif /* ! __LINUX_SECURITY_H */
-

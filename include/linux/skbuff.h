@@ -40,6 +40,13 @@
 #include <linux/if_packet.h>
 #include <net/flow.h>
 
+#ifdef VENDOR_EDIT
+//Junyuan.Huang@PSW.CN.WiFi.Network.1471780, 2018/06/26,
+//Add for limit speed function
+#include <linux/imq.h>
+#endif /* VENDOR_EDIT */
+
+
 /* The interface for checksum offload between the stack and networking drivers
  * is as follows...
  *
@@ -643,14 +650,9 @@ struct sk_buff {
 				struct skb_mstamp skb_mstamp;
 			};
 		};
-		struct rb_node		rbnode; /* used in netem, ip4 defrag, and tcp stack */
+		struct rb_node	rbnode; /* used in netem & tcp stack */
 	};
-
-	union {
-		struct sock		*sk;
-		int			ip_defrag_offset;
-	};
-
+	struct sock		*sk;
 	struct net_device	*dev;
 
 	/*
@@ -660,6 +662,11 @@ struct sk_buff {
 	 * first. This is owned by whoever has the skb queued ATM.
 	 */
 	char			cb[48] __aligned(8);
+#ifdef VENDOR_EDIT
+//Junyuan.Huang@PSW.CN.WiFi.Network.1471780, 2018/06/26,
+//Add for limit speed function
+	void			*cb_next;
+#endif /*VENDOR_EDIT*/
 
 	unsigned long		_skb_refdst;
 	void			(*destructor)(struct sk_buff *skb);
@@ -669,6 +676,11 @@ struct sk_buff {
 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
 	struct nf_conntrack	*nfct;
 #endif
+#ifdef VENDOR_EDIT
+//Junyuan.Huang@PSW.CN.WiFi.Network.1471780, 2018/06/26,
+//Add for limit speed function
+       struct nf_queue_entry   *nf_queue_entry;
+#endif /*VENDOR_EDIT*/
 #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 	struct nf_bridge_info	*nf_bridge;
 #endif
@@ -748,6 +760,11 @@ struct sk_buff {
 	__u8			offload_fwd_mark:1;
 #endif
 	/* 2, 4 or 5 bit hole */
+#ifdef VENDOR_EDIT
+//Junyuan.Huang@PSW.CN.WiFi.Network.1471780, 2018/06/26,
+//Add for limit speed function
+	__u8			imq_flags:IMQ_F_BITS;
+#endif /*VENDOR_EDIT*/
 
 #ifdef CONFIG_NET_SCHED
 	__u16			tc_index;	/* traffic control index */
@@ -908,6 +925,14 @@ void kfree_skb_list(struct sk_buff *segs);
 void skb_tx_error(struct sk_buff *skb);
 void consume_skb(struct sk_buff *skb);
 void  __kfree_skb(struct sk_buff *skb);
+
+#ifdef VENDOR_EDIT
+//Junyuan.Huang@PSW.CN.WiFi.Network.1471780, 2018/06/26,
+//Add for limit speed function
+int skb_save_cb(struct sk_buff *skb);
+int skb_restore_cb(struct sk_buff *skb);
+#endif /*VENDOR_EDIT*/
+
 extern struct kmem_cache *skbuff_head_cache;
 
 void kfree_skb_partial(struct sk_buff *skb, bool head_stolen);
@@ -1178,8 +1203,7 @@ static inline __u32 skb_get_hash_flowi4(struct sk_buff *skb, const struct flowi4
 	return skb->hash;
 }
 
-__u32 skb_get_hash_perturb(const struct sk_buff *skb,
-			   const siphash_key_t *perturb);
+__u32 skb_get_hash_perturb(const struct sk_buff *skb, u32 perturb);
 
 static inline __u32 skb_get_hash_raw(const struct sk_buff *skb)
 {
@@ -1550,18 +1574,6 @@ static inline __u32 skb_queue_len(const struct sk_buff_head *list_)
 }
 
 /**
- *	skb_queue_len_lockless	- get queue length
- *	@list_: list to measure
- *
- *	Return the length of an &sk_buff queue.
- *	This variant can be used in lockless contexts.
- */
-static inline __u32 skb_queue_len_lockless(const struct sk_buff_head *list_)
-{
-	return READ_ONCE(list_->qlen);
-}
-
-/**
  *	__skb_queue_head_init - initialize non-spinlock portions of sk_buff_head
  *	@list: queue to initialize
  *
@@ -1613,7 +1625,7 @@ static inline void __skb_insert(struct sk_buff *newsk,
 	newsk->next = next;
 	newsk->prev = prev;
 	next->prev  = prev->next = newsk;
-	WRITE_ONCE(list->qlen, list->qlen + 1);
+	list->qlen++;
 }
 
 static inline void __skb_queue_splice(const struct sk_buff_head *list,
@@ -1764,7 +1776,7 @@ static inline void __skb_unlink(struct sk_buff *skb, struct sk_buff_head *list)
 {
 	struct sk_buff *next, *prev;
 
-	WRITE_ONCE(list->qlen, list->qlen - 1);
+	list->qlen--;
 	next	   = skb->next;
 	prev	   = skb->prev;
 	skb->next  = skb->prev = NULL;
@@ -2431,7 +2443,7 @@ static inline void __skb_queue_purge(struct sk_buff_head *list)
 		kfree_skb(skb);
 }
 
-unsigned int skb_rbtree_purge(struct rb_root *root);
+void skb_rbtree_purge(struct rb_root *root);
 
 void *netdev_alloc_frag(unsigned int fragsz);
 
@@ -2807,7 +2819,7 @@ static inline int skb_padto(struct sk_buff *skb, unsigned int len)
  *	is untouched. Otherwise it is extended. Returns zero on
  *	success. The skb is freed on error.
  */
-static inline int __must_check skb_put_padto(struct sk_buff *skb, unsigned int len)
+static inline int skb_put_padto(struct sk_buff *skb, unsigned int len)
 {
 	unsigned int size = skb->len;
 
@@ -2967,7 +2979,6 @@ static inline unsigned char *skb_push_rcsum(struct sk_buff *skb,
 	return skb->data;
 }
 
-int pskb_trim_rcsum_slow(struct sk_buff *skb, unsigned int len);
 /**
  *	pskb_trim_rcsum - trim received skb and update checksum
  *	@skb: buffer to trim
@@ -2975,14 +2986,15 @@ int pskb_trim_rcsum_slow(struct sk_buff *skb, unsigned int len);
  *
  *	This is exactly the same as pskb_trim except that it ensures the
  *	checksum of received packets are still valid after the operation.
- *	It can change skb pointers.
  */
 
 static inline int pskb_trim_rcsum(struct sk_buff *skb, unsigned int len)
 {
 	if (likely(len >= skb->len))
 		return 0;
-	return pskb_trim_rcsum_slow(skb, len);
+	if (skb->ip_summed == CHECKSUM_COMPLETE)
+		skb->ip_summed = CHECKSUM_NONE;
+	return __pskb_trim(skb, len);
 }
 
 static inline int __skb_trim_rcsum(struct sk_buff *skb, unsigned int len)
@@ -3002,11 +3014,6 @@ static inline int __skb_grow_rcsum(struct sk_buff *skb, unsigned int len)
 
 #define rb_to_skb(rb) rb_entry_safe(rb, struct sk_buff, rbnode)
 
-#define rb_to_skb(rb) rb_entry_safe(rb, struct sk_buff, rbnode)
-#define skb_rb_first(root) rb_to_skb(rb_first(root))
-#define skb_rb_last(root)  rb_to_skb(rb_last(root))
-#define skb_rb_next(skb)   rb_to_skb(rb_next(&(skb)->rbnode))
-#define skb_rb_prev(skb)   rb_to_skb(rb_prev(&(skb)->rbnode))
 
 #define skb_queue_walk(queue, skb) \
 		for (skb = (queue)->next;					\
@@ -3021,18 +3028,6 @@ static inline int __skb_grow_rcsum(struct sk_buff *skb, unsigned int len)
 #define skb_queue_walk_from(queue, skb)						\
 		for (; skb != (struct sk_buff *)(queue);			\
 		     skb = skb->next)
-
-#define skb_rbtree_walk(skb, root)						\
-		for (skb = skb_rb_first(root); skb != NULL;			\
-		     skb = skb_rb_next(skb))
-
-#define skb_rbtree_walk_from(skb)						\
-		for (; skb != NULL;						\
-		     skb = skb_rb_next(skb))
-
-#define skb_rbtree_walk_from_safe(skb, tmp)					\
-		for (; tmp = skb ? skb_rb_next(skb) : NULL, (skb != NULL);	\
-		     skb = tmp)
 
 #define skb_queue_walk_from_safe(queue, skb, tmp)				\
 		for (tmp = skb->next;						\
@@ -3115,7 +3110,6 @@ int skb_shift(struct sk_buff *tgt, struct sk_buff *skb, int shiftlen);
 void skb_scrub_packet(struct sk_buff *skb, bool xnet);
 unsigned int skb_gso_transport_seglen(const struct sk_buff *skb);
 bool skb_gso_validate_mtu(const struct sk_buff *skb, unsigned int mtu);
-bool skb_gso_validate_mac_len(const struct sk_buff *skb, unsigned int len);
 struct sk_buff *skb_segment(struct sk_buff *skb, netdev_features_t features);
 struct sk_buff *skb_vlan_untag(struct sk_buff *skb);
 int skb_ensure_writable(struct sk_buff *skb, int write_len);
@@ -3640,6 +3634,12 @@ static inline void __nf_copy(struct sk_buff *dst, const struct sk_buff *src,
 	if (copy)
 		dst->nfctinfo = src->nfctinfo;
 #endif
+#ifdef VENDOR_EDIT
+//Junyuan.Huang@PSW.CN.WiFi.Network.1471780, 2018/06/26,
+//Add for limit speed function
+       dst->imq_flags = src->imq_flags;
+       dst->nf_queue_entry = src->nf_queue_entry;
+#endif /*VENDOR_EDIT*/
 #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
 	dst->nf_bridge  = src->nf_bridge;
 	nf_bridge_get(src->nf_bridge);
@@ -3891,21 +3891,6 @@ static inline unsigned int skb_gso_network_seglen(const struct sk_buff *skb)
 {
 	unsigned int hdr_len = skb_transport_header(skb) -
 			       skb_network_header(skb);
-	return hdr_len + skb_gso_transport_seglen(skb);
-}
-
-/**
- * skb_gso_mac_seglen - Return length of individual segments of a gso packet
- *
- * @skb: GSO skb
- *
- * skb_gso_mac_seglen is used to determine the real size of the
- * individual segments, including MAC/L2, Layer3 (IP, IPv6) and L4
- * headers (TCP/UDP).
- */
-static inline unsigned int skb_gso_mac_seglen(const struct sk_buff *skb)
-{
-	unsigned int hdr_len = skb_transport_header(skb) - skb_mac_header(skb);
 	return hdr_len + skb_gso_transport_seglen(skb);
 }
 

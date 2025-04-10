@@ -221,8 +221,14 @@ static inline struct page *page_cache_alloc_cold(struct address_space *x)
 
 static inline gfp_t readahead_gfp_mask(struct address_space *x)
 {
+#ifdef CONFIG_CMA_REFUSE_PAGE_CACHE
 	return mapping_gfp_mask(x) |
 				  __GFP_COLD | __GFP_NORETRY | __GFP_NOWARN;
+#else
+	return mapping_gfp_mask(x) |
+				  __GFP_COLD | __GFP_NORETRY | __GFP_NOWARN |
+				  __GFP_CMA;
+#endif
 }
 
 typedef int filler_t(struct file *, struct page *);
@@ -374,7 +380,7 @@ static inline struct page *read_mapping_page(struct address_space *mapping,
 }
 
 /*
- * Get index of the page within radix-tree (but not for hugetlb pages).
+ * Get index of the page with in radix-tree
  * (TODO: remove once hugetlb pages will have ->index in PAGE_SIZE)
  */
 static inline pgoff_t page_to_index(struct page *page)
@@ -393,16 +399,15 @@ static inline pgoff_t page_to_index(struct page *page)
 	return pgoff;
 }
 
-extern pgoff_t hugetlb_basepage_index(struct page *page);
-
 /*
- * Get the offset in PAGE_SIZE (even for hugetlb pages).
- * (TODO: hugetlb pages should have ->index in PAGE_SIZE)
+ * Get the offset in PAGE_SIZE.
+ * (TODO: hugepage should have ->index in PAGE_SIZE)
  */
 static inline pgoff_t page_to_pgoff(struct page *page)
 {
-	if (unlikely(PageHuge(page)))
-		return hugetlb_basepage_index(page);
+	if (unlikely(PageHeadHuge(page)))
+		return page->index << compound_order(page);
+
 	return page_to_index(page);
 }
 

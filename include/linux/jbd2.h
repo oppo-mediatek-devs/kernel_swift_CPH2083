@@ -1151,11 +1151,20 @@ struct journal_s
 #endif
 };
 
+/*
+ * MTK WA:
+ * Disable jbd2_handle lockdep checking.
+ * See start_this_handle() for details.
+ */
+#if 1
+#define jbd2_might_wait_for_commit(j)
+#else
 #define jbd2_might_wait_for_commit(j) \
 	do { \
 		rwsem_acquire(&j->j_trans_commit_map, 0, 0, _THIS_IP_); \
 		rwsem_release(&j->j_trans_commit_map, 1, _THIS_IP_); \
 	} while (0)
+#endif
 
 /* journal feature predicate functions */
 #define JBD2_FEATURE_COMPAT_FUNCS(name, flagname) \
@@ -1560,7 +1569,7 @@ static inline int jbd2_space_needed(journal_t *journal)
 static inline unsigned long jbd2_log_space_left(journal_t *journal)
 {
 	/* Allow for rounding errors */
-	long free = journal->j_free - 32;
+	unsigned long free = journal->j_free - 32;
 
 	if (journal->j_committing_transaction) {
 		unsigned long committing = atomic_read(&journal->
@@ -1569,7 +1578,7 @@ static inline unsigned long jbd2_log_space_left(journal_t *journal)
 		/* Transaction + control blocks */
 		free -= committing + (committing >> JBD2_CONTROL_BLOCKS_SHIFT);
 	}
-	return max_t(long, free, 0);
+	return free;
 }
 
 /*

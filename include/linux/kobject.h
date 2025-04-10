@@ -29,8 +29,14 @@
 #include <linux/workqueue.h>
 
 #define UEVENT_HELPER_PATH_LEN		256
+#ifdef VENDOR_EDIT
+/* Jianchao.Shi@BSP.CHG.Basic, 2019/07/29, sjc Modify for charging */
+#define UEVENT_NUM_ENVP			128	/* number of env pointers */
+#define UEVENT_BUFFER_SIZE		4096	/* buffer for the variables */
+#else
 #define UEVENT_NUM_ENVP			32	/* number of env pointers */
 #define UEVENT_BUFFER_SIZE		2048	/* buffer for the variables */
+#endif
 
 #ifdef CONFIG_UEVENT_HELPER
 /* path to the userspace helper executed on an event */
@@ -108,29 +114,10 @@ extern int __must_check kobject_rename(struct kobject *, const char *new_name);
 extern int __must_check kobject_move(struct kobject *, struct kobject *);
 
 extern struct kobject *kobject_get(struct kobject *kobj);
-extern struct kobject * __must_check kobject_get_unless_zero(
-						struct kobject *kobj);
 extern void kobject_put(struct kobject *kobj);
 
 extern const void *kobject_namespace(struct kobject *kobj);
 extern char *kobject_get_path(struct kobject *kobj, gfp_t flag);
-
-/**
- * kobject_has_children - Returns whether a kobject has children.
- * @kobj: the object to test
- *
- * This will return whether a kobject has other kobjects as children.
- *
- * It does NOT account for the presence of attribute files, only sub
- * directories. It also assumes there is no concurrent addition or
- * removal of such children, and thus relies on external locking.
- */
-static inline bool kobject_has_children(struct kobject *kobj)
-{
-	WARN_ON_ONCE(atomic_read(&kobj->kref.refcount) == 0);
-
-	return kobj->sd && kobj->sd->dir.subdirs;
-}
 
 struct kobj_type {
 	void (*release)(struct kobject *kobj);

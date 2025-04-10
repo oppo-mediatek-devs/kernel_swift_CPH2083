@@ -202,7 +202,6 @@ void __wake_up_locked_key(wait_queue_head_t *q, unsigned int mode, void *key);
 void __wake_up_sync_key(wait_queue_head_t *q, unsigned int mode, int nr, void *key);
 void __wake_up_locked(wait_queue_head_t *q, unsigned int mode, int nr);
 void __wake_up_sync(wait_queue_head_t *q, unsigned int mode, int nr);
-void __wake_up_pollfree(wait_queue_head_t *wq_head);
 void __wake_up_bit(wait_queue_head_t *, void *, int);
 int __wait_on_bit(wait_queue_head_t *, struct wait_bit_queue *, wait_bit_action_f *, unsigned);
 int __wait_on_bit_lock(wait_queue_head_t *, struct wait_bit_queue *, wait_bit_action_f *, unsigned);
@@ -237,31 +236,6 @@ wait_queue_head_t *bit_waitqueue(void *, int);
 #define wake_up_interruptible_sync_poll(x, m)				\
 	__wake_up_sync_key((x), TASK_INTERRUPTIBLE, 1, (void *) (m))
 
-/**
- * wake_up_pollfree - signal that a polled waitqueue is going away
- * @wq_head: the wait queue head
- *
- * In the very rare cases where a ->poll() implementation uses a waitqueue whose
- * lifetime is tied to a task rather than to the 'struct file' being polled,
- * this function must be called before the waitqueue is freed so that
- * non-blocking polls (e.g. epoll) are notified that the queue is going away.
- *
- * The caller must also RCU-delay the freeing of the wait_queue_head, e.g. via
- * an explicit synchronize_rcu() or call_rcu(), or via SLAB_DESTROY_BY_RCU.
- */
-static inline void wake_up_pollfree(wait_queue_head_t *wq_head)
-{
-	/*
-	 * For performance reasons, we don't always take the queue lock here.
-	 * Therefore, we might race with someone removing the last entry from
-	 * the queue, and proceed while they still hold the queue lock.
-	 * However, rcu_read_lock() is required to be held in such cases, so we
-	 * can safely proceed with an RCU-delayed free.
-	 */
-	if (waitqueue_active(wq_head))
-		__wake_up_pollfree(wq_head);
-}
-
 #define ___wait_cond_timeout(condition)					\
 ({									\
 	bool __cond = (condition);					\
@@ -287,7 +261,7 @@ extern void init_wait_entry(wait_queue_t *__wait, int flags);
  * on purpose; we use long where we can return timeout values and int
  * otherwise.
  */
-
+//#ifdef VENDOR_EDIT //fangpan@Swdp.shanghai,2015/11/12
 #define ___wait_event(wq, condition, state, exclusive, ret, cmd)	\
 ({									\
 	__label__ __out;						\
@@ -306,11 +280,15 @@ extern void init_wait_entry(wait_queue_t *__wait, int flags);
 			goto __out;					\
 		}							\
 									\
+		if(hung_long_and_fatal_signal_pending(current)) { 	\
+			break;						\
+		}							\
 		cmd;							\
 	}								\
 	finish_wait(&wq, &__wait);					\
 __out:	__ret;								\
 })
+//#endif
 
 #define __wait_event(wq, condition)					\
 	(void)___wait_event(wq, condition, TASK_UNINTERRUPTIBLE, 0, 0,	\

@@ -262,8 +262,7 @@ struct binder_node_debug_info {
 #define BINDER_THREAD_EXIT		_IOW('b', 8, __s32)
 #define BINDER_VERSION			_IOWR('b', 9, struct binder_version)
 #define BINDER_GET_NODE_DEBUG_INFO	_IOWR('b', 11, struct binder_node_debug_info)
-#define BINDER_SET_CONTEXT_MGR_EXT	_IOW('b', 13, struct flat_binder_object)
-
+#define BINDER_SET_CONTEXT_MGR_EXT     _IOW('b', 13, struct flat_binder_object)
 /*
  * NOTE: Two special error codes you should check for when calling
  * in to the driver are:
@@ -527,6 +526,16 @@ enum binder_driver_command_protocol {
 	 * binder_transaction_data_sg: the sent command.
 	 */
 };
+
+#ifdef VENDOR_EDIT
+//zhoumingjun@Swdp.shanghai, 2017/07/10, notify user space when binder transaction starts
+struct process_event_binder {
+    struct task_struct *src;
+    struct task_struct *dst;
+    __u32 code;
+    __u32 flags;
+};
+#endif
 
 #endif /* _UAPI_LINUX_BINDER_H */
 

@@ -5,7 +5,6 @@
 
 #include <linux/sched/prio.h>
 
-
 struct sched_param {
 	int sched_priority;
 };
@@ -75,8 +74,33 @@ struct sched_param {
  * the tasks may be useful for a wide variety of application fields, e.g.,
  * multimedia, streaming, automation and control, and many others.
  *
- * This variant (sched_attr) is meant at describing a so-called
- * sporadic time-constrained task. In such model a task is specified by:
+ * This variant (sched_attr) allows to define additional attributes to
+ * improve the scheduler knowledge about task requirements.
+ *
+ * Scheduling Class Attributes
+ * ===========================
+ *
+ * A subset of sched_attr attributes specifies the
+ * scheduling policy and relative POSIX attributes:
+ *
+ *  @size		size of the structure, for fwd/bwd compat.
+ *
+ *  @sched_policy	task's scheduling policy
+ *  @sched_nice		task's nice value      (SCHED_NORMAL/BATCH)
+ *  @sched_priority	task's static priority (SCHED_FIFO/RR)
+ *
+ * Certain more advanced scheduling features can be controlled by a
+ * predefined set of flags via the attribute:
+ *
+ *  @sched_flags	for customizing the scheduler behaviour
+ *
+ * Sporadic Time-Constrained Tasks Attributes
+ * ==========================================
+ *
+ * A subset of sched_attr attributes allows to describe a so-called
+ * sporadic time-constrained task.
+ *
+ * In such model a task is specified by:
  *  - the activation period or minimum instance inter-arrival time;
  *  - the maximum (or average, depending on the actual scheduling
  *    discipline) computation time of all instances, a.k.a. runtime;
@@ -88,14 +112,8 @@ struct sched_param {
  * than the runtime and must be completed by time instant t equal to
  * the instance activation time + the deadline.
  *
- * This is reflected by the actual fields of the sched_attr structure:
+ * This is reflected by the following fields of the sched_attr structure:
  *
- *  @size		size of the structure, for fwd/bwd compat.
- *
- *  @sched_policy	task's scheduling policy
- *  @sched_flags	for customizing the scheduler behaviour
- *  @sched_nice		task's nice value      (SCHED_NORMAL/BATCH)
- *  @sched_priority	task's static priority (SCHED_FIFO/RR)
  *  @sched_deadline	representative of the task's deadline
  *  @sched_runtime	representative of the task's runtime
  *  @sched_period	representative of the task's period
@@ -109,21 +127,21 @@ struct sched_param {
  * available in the scheduling class file or in Documentation/.
  */
 struct sched_attr {
-	u32 size;
+	__u32 size;
 
-	u32 sched_policy;
-	u64 sched_flags;
+	__u32 sched_policy;
+	__u64 sched_flags;
 
 	/* SCHED_NORMAL, SCHED_BATCH */
-	s32 sched_nice;
+	__s32 sched_nice;
 
 	/* SCHED_FIFO, SCHED_RR */
-	u32 sched_priority;
+	__u32 sched_priority;
 
 	/* SCHED_DEADLINE */
-	u64 sched_runtime;
-	u64 sched_deadline;
-	u64 sched_period;
+	__u64 sched_runtime;
+	__u64 sched_deadline;
+	__u64 sched_period;
 };
 
 struct futex_pi_state;
@@ -315,6 +333,25 @@ extern char ___assert_task_state[1 - 2*!!(
 
 #endif
 
+#ifdef VENDOR_EDIT
+// Liujie.Xie@TECH.Kernel.Sched, 2019/05/22, add for ui first
+enum DYNAMIC_UX_TYPE
+{
+    DYNAMIC_UX_BINDER = 0,
+    DYNAMIC_UX_RWSEM,
+    DYNAMIC_UX_MUTEX,
+    DYNAMIC_UX_SEM,
+    DYNAMIC_UX_FUTEX,
+    DYNAMIC_UX_MAX,
+};
+
+#define UX_MSG_LEN 64
+#define UX_DEPTH_MAX 2
+
+extern int sysctl_uifirst_enabled;
+extern int sysctl_launcher_boost_enabled;
+#endif /* VENDOR_EDIT */
+
 /* Task command name length */
 #define TASK_COMM_LEN 16
 
@@ -353,6 +390,41 @@ extern void init_idle_bootup_task(struct task_struct *idle);
 extern cpumask_var_t cpu_isolated_map;
 
 extern int runqueue_is_locked(int cpu);
+
+#ifdef CONFIG_HOTPLUG_CPU
+extern int sched_isolate_count(const cpumask_t *mask, bool include_offline);
+extern int sched_isolate_cpu(int cpu);
+extern int sched_deisolate_cpu(int cpu);
+extern int sched_deisolate_cpu_unlocked(int cpu);
+#else
+static inline int sched_isolate_count(const cpumask_t *mask,
+				      bool include_offline)
+{
+	cpumask_t count_mask;
+
+	if (include_offline)
+		cpumask_andnot(&count_mask, mask, cpu_online_mask);
+	else
+		return 0;
+
+	return cpumask_weight(&count_mask);
+}
+
+static inline int sched_isolate_cpu(int cpu)
+{
+	return 0;
+}
+
+static inline int sched_deisolate_cpu(int cpu)
+{
+	return 0;
+}
+
+static inline int sched_deisolate_cpu_unlocked(int cpu)
+{
+	return 0;
+}
+#endif
 
 #if defined(CONFIG_SMP) && defined(CONFIG_NO_HZ_COMMON)
 extern void nohz_balance_enter_idle(int cpu);
@@ -539,7 +611,6 @@ static inline int get_dumpable(struct mm_struct *mm)
 #define MMF_OOM_SKIP		21	/* mm is of no interest for the OOM killer */
 #define MMF_UNSTABLE		22	/* mm is unstable for copy_from_user */
 #define MMF_HUGE_ZERO_PAGE	23      /* mm has ever used the global huge zero page */
-#define MMF_OOM_REAP_QUEUED	26	/* mm was queued for oom_reaper */
 
 #define MMF_INIT_MASK		(MMF_DUMPABLE_MASK | MMF_DUMP_FILTER_MASK)
 
@@ -910,6 +981,17 @@ extern struct user_struct root_user;
 struct backing_dev_info;
 struct reclaim_state;
 
+enum uclamp_id {
+	/* No utilization clamp group assigned */
+	UCLAMP_NONE = -1,
+
+	UCLAMP_MIN = 0, /* Minimum utilization */
+	UCLAMP_MAX,     /* Maximum utilization */
+
+	/* Utilization clamping constraints count */
+	UCLAMP_CNT
+};
+
 #ifdef CONFIG_SCHED_INFO
 struct sched_info {
 	/* cumulative counters */
@@ -989,6 +1071,27 @@ enum cpu_idle_type {
 # define SCHED_FIXEDPOINT_SHIFT	10
 # define SCHED_FIXEDPOINT_SCALE	(1L << SCHED_FIXEDPOINT_SHIFT)
 
+static inline unsigned int scale_from_percent(unsigned int pct)
+{
+	WARN_ON(pct > 100);
+
+	return ((SCHED_FIXEDPOINT_SCALE * pct) / 100);
+}
+
+static inline unsigned int scale_to_percent(unsigned int value)
+{
+	unsigned int rounding = 0;
+
+	WARN_ON(value > SCHED_FIXEDPOINT_SCALE);
+
+	/* Compensate rounding errors for: 0, 256, 512, 768, 1024 */
+	if (likely((value & 0xFF) && ~(value & 0x700)))
+		rounding = 1;
+
+	return (rounding + ((100 * value) / SCHED_FIXEDPOINT_SCALE));
+}
+
+
 /*
  * Increase resolution of cpu_capacity calculations
  */
@@ -1002,6 +1105,20 @@ struct sched_capacity_reqs {
 
 	unsigned long total;
 };
+
+#if defined(CONFIG_UCLAMP_TASK) && defined(CONFIG_MTK_UNIFY_POWER)
+extern int opp_capacity_tbl_ready;
+extern void init_opp_capacity_tbl(void);
+extern unsigned int find_fit_capacity(unsigned int cap);
+static inline unsigned int search_opp_cappacity(unsigned int cap)
+{
+	if (unlikely(!opp_capacity_tbl_ready)) {
+		init_opp_capacity_tbl();
+	}
+
+	return find_fit_capacity(cap);
+}
+#endif
 
 /*
  * Wake-queues are lists of tasks with a pending wakeup, whose
@@ -1100,19 +1217,64 @@ struct sched_domain_attr {
 extern int sched_domain_level_max;
 
 struct capacity_state {
+#ifndef CONFIG_MTK_UNIFY_POWER
 	unsigned long cap;	/* compute capacity */
 	unsigned long power;	/* power consumption at this compute capacity */
+#else
+	unsigned long long cap;	/* compute capacity */
+	unsigned int volt;	/* 10uv */
+	unsigned int dyn_pwr;	/* power consumption at this compute capacity */
+	unsigned int lkg_pwr[1];
+#endif
 };
 
 struct idle_state {
 	unsigned long power;	 /* power consumption in this idle state */
 };
 
+#ifdef CONFIG_MTK_SCHED_EAS_POWER_SUPPORT
+typedef int (*idle_power_func)(int, int, int, void *, int);
+typedef int (*busy_power_func)(int, int, void*, int);
+#endif
+
+/* For multi-scheudling support */
+enum SCHED_LB_TYPE {
+	SCHED_HMP_LB = 0,
+	SCHED_EAS_LB,
+	SCHED_HYBRID_LB,
+	SCHED_UNKNOWN_LB
+};
+
+#ifdef CONFIG_MTK_SCHED_BOOST
+extern bool sched_boost(void);
+#else
+static inline bool sched_boost(void)
+{
+	return 0;
+}
+#endif
+
+#ifdef VENDOR_EDIT
+extern int sched_get_updown_migrate(unsigned int *up_migrate,
+				unsigned int *down_migrate);
+extern int sched_set_updown_migrate(unsigned int up_migrate,
+				unsigned int down_migrate);
+#endif
+
 struct sched_group_energy {
+#ifdef CONFIG_MTK_SCHED_EAS_POWER_SUPPORT
+	idle_power_func idle_power;
+	busy_power_func busy_power;
+#endif
 	unsigned int nr_idle_states;	/* number of idle states */
 	struct idle_state *idle_states;	/* ptr to idle state array */
 	unsigned int nr_cap_states;	/* number of capacity states */
+#ifdef CONFIG_MTK_UNIFY_POWER
+	struct upower_tbl_row *cap_states;
+	unsigned int lkg_idx;
+#else
 	struct capacity_state *cap_states; /* ptr to capacity state array */
+#endif
 };
 
 unsigned long capacity_curr_of(int cpu);
@@ -1383,6 +1545,15 @@ struct sched_avg {
 	u64 last_update_time, load_sum;
 	u32 util_sum, period_contrib;
 	unsigned long load_avg, util_avg;
+#ifdef CONFIG_SCHED_HMP
+	unsigned long loadwop_avg, loadwop_sum;
+	unsigned long pending_load;
+	u32 nr_pending;
+	u32 nr_dequeuing_low_prio;
+	u32 nr_normal_prio;
+	u64 hmp_last_up_migration;
+	u64 hmp_last_down_migration;
+#endif /* CONFIG_SCHED_HMP */
 };
 
 #ifdef CONFIG_SCHEDSTATS
@@ -1494,6 +1665,16 @@ struct sched_entity {
 	u64			exec_start;
 	u64			sum_exec_runtime;
 	u64			vruntime;
+#ifdef CONFIG_SCHED_HMP
+	unsigned long pending_load;
+	u32 nr_pending;
+#ifdef CONFIG_SCHED_HMP_PRIO_FILTER
+	u32 nr_dequeuing_low_prio;
+	u32 nr_normal_prio;
+#endif
+	u64 hmp_last_up_migration;
+	u64 hmp_last_down_migration;
+#endif /* CONFIG_SCHED_HMP */
 	u64			prev_sum_exec_runtime;
 
 	u64			nr_migrations;
@@ -1520,6 +1701,11 @@ struct sched_entity {
 	 */
 	struct sched_avg	avg ____cacheline_aligned_in_smp;
 #endif
+
+#ifdef CONFIG_MTK_RT_THROTTLE_MON
+	u64			mtk_isr_time;
+#endif
+
 };
 
 struct sched_rt_entity {
@@ -1586,6 +1772,21 @@ struct sched_dl_entity {
 	struct hrtimer dl_timer;
 };
 
+/**
+ * Utilization's clamp group
+ *
+ * A utilization clamp group maps a "clamp value" (value), i.e.
+ * util_{min,max}, to a "clamp group index" (group_id).
+ * The same "group_id" can be used by multiple TG's to enforce the same
+ * clamp "value" for a given clamp index.
+ */
+struct uclamp_se {
+	/* Utilization constraint for tasks in this group */
+	unsigned int value;
+	/* Utilization clamp group for this constraint */
+	unsigned int group_id;
+};
+
 union rcu_special {
 	struct {
 		u8 blocked;
@@ -1603,6 +1804,16 @@ enum perf_event_task_context {
 	perf_sw_context,
 	perf_nr_task_contexts,
 };
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_PROCESS_RECLAIM)
+/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/04
+ * Record process reclaim infor
+ */
+union reclaim_limit {
+	unsigned long stop_jiffies;
+	unsigned long stop_scan_addr;
+};
+#endif
 
 /* Track pages that require TLB flushes */
 struct tlbflush_unmap_batch {
@@ -1650,6 +1861,9 @@ struct task_struct {
 	int wake_cpu;
 #endif
 	int on_rq;
+#ifdef CONFIG_MTK_SCHED_BOOST
+	int cpu_prefer;
+#endif
 
 	int prio, static_prio, normal_prio;
 	unsigned int rt_priority;
@@ -1665,11 +1879,19 @@ struct task_struct {
 	u32 init_load_pct;
 	u64 last_sleep_ts;
 #endif
+	u64 last_enqueued_ts;
 
 #ifdef CONFIG_CGROUP_SCHED
 	struct task_group *sched_task_group;
 #endif
 	struct sched_dl_entity dl;
+
+#ifdef CONFIG_UCLAMP_TASK
+	/* Clamp group the task is currently accounted into */
+	int				uclamp_group_id[UCLAMP_CNT];
+	/* Utlization clamp values for this task */
+	struct uclamp_se		uclamp[UCLAMP_CNT];
+#endif
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	/* list of struct preempt_notifier: */
@@ -1821,6 +2043,12 @@ struct task_struct {
 /* mm fault and swap info: this can arguably be seen as either mm-specific or thread-specific */
 	unsigned long min_flt, maj_flt;
 
+	/* for thrashing accounting */
+	unsigned long fm_flt;
+#ifdef CONFIG_SWAP
+	unsigned long swap_in, swap_out;
+#endif
+
 	struct task_cputime cputime_expires;
 	struct list_head cpu_timers[3];
 
@@ -1873,8 +2101,8 @@ struct task_struct {
 	struct seccomp seccomp;
 
 /* Thread group tracking */
-	u64 parent_exec_id;
-	u64 self_exec_id;
+   	u32 parent_exec_id;
+   	u32 self_exec_id;
 /* Protection of (de-)allocation: mm, files, fs, tty, keyrings, mems_allowed,
  * mempolicy */
 	spinlock_t alloc_lock;
@@ -1912,7 +2140,7 @@ struct task_struct {
 	int softirq_context;
 #endif
 #ifdef CONFIG_LOCKDEP
-# define MAX_LOCK_DEPTH 48UL
+# define MAX_LOCK_DEPTH 32UL
 	u64 curr_chain_key;
 	int lockdep_depth;
 	unsigned int lockdep_recursion;
@@ -1968,8 +2196,6 @@ struct task_struct {
 #endif
 	struct list_head pi_state_list;
 	struct futex_pi_state *pi_state_cache;
-	struct mutex futex_exit_mutex;
-	unsigned int futex_state;
 #endif
 #ifdef CONFIG_PERF_EVENTS
 	struct perf_event_context *perf_event_ctxp[perf_nr_task_contexts];
@@ -2127,6 +2353,38 @@ struct task_struct {
 	/* A live task holds one reference. */
 	atomic_t stack_refcount;
 #endif
+
+#ifdef CONFIG_PREEMPT_MONITOR
+	unsigned long preempt_dur;
+#endif
+#ifdef CONFIG_MTK_CACHE_CONTROL
+	u64 stall_ratio;
+	u64 badness;
+#endif
+#if defined(VENDOR_EDIT) && defined(CONFIG_PROCESS_RECLAIM)
+	/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/04
+	 * Record process reclaim infor
+	 */
+	union reclaim_limit reclaim;
+#endif
+#if defined(VENDOR_EDIT) && defined(CONFIG_PROCESS_RECLAIM) && defined(CONFIG_OPPO_SPECIAL_BUILD)
+	/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/05
+	 * record the time used of process reclaim
+	 */
+	unsigned long reclaim_ns;
+	unsigned long reclaim_run_ns;
+	unsigned long reclaim_intr_ns;
+#endif
+#ifdef VENDOR_EDIT
+// Liujie.Xie@TECH.Kernel.Sched, 2019/05/22, add for ui first
+    int static_ux;
+    atomic64_t dynamic_ux;
+    struct list_head ux_entry;
+    int ux_depth;
+    u64 enqueue_time;
+    u64 dynamic_ux_start;
+#endif /* VENDOR_EDIT */
+
 /* CPU-specific state of this task */
 	struct thread_struct thread;
 /*
@@ -2157,6 +2415,11 @@ static inline struct vm_struct *task_stack_vm_area(const struct task_struct *t)
 
 /* Future-safe accessor for struct task_struct's cpus_allowed. */
 #define tsk_cpus_allowed(tsk) (&(tsk)->cpus_allowed)
+enum iso_prio_t {ISO_CUSTOMIZE, ISO_TURBO, ISO_SCHED, ISO_UNSET};
+extern int set_cpu_isolation(enum iso_prio_t prio, struct cpumask *cpumask_ptr);
+extern int unset_cpu_isolation(enum iso_prio_t prio);
+extern struct cpumask cpu_all_masks;
+extern enum iso_prio_t iso_prio;
 
 static inline int tsk_nr_cpus_allowed(struct task_struct *p)
 {
@@ -2199,7 +2462,7 @@ static inline bool in_vfork(struct task_struct *tsk)
 extern void task_numa_fault(int last_node, int node, int pages, int flags);
 extern pid_t task_numa_group_id(struct task_struct *p);
 extern void set_numabalancing_state(bool enabled);
-extern void task_numa_free(struct task_struct *p, bool final);
+extern void task_numa_free(struct task_struct *p);
 extern bool should_numa_migrate_memory(struct task_struct *p, struct page *page,
 					int src_nid, int dst_cpu);
 #else
@@ -2214,7 +2477,7 @@ static inline pid_t task_numa_group_id(struct task_struct *p)
 static inline void set_numabalancing_state(bool enabled)
 {
 }
-static inline void task_numa_free(struct task_struct *p, bool final)
+static inline void task_numa_free(struct task_struct *p)
 {
 }
 static inline bool should_numa_migrate_memory(struct task_struct *p,
@@ -2430,7 +2693,12 @@ extern void thread_group_cputime_adjusted(struct task_struct *p, cputime_t *ut, 
 /*
  * Per process flags
  */
+#ifdef VENDOR_EDIT
+/* fanhui@PhoneSW.BSP, 2016/02/02, DeathHealer, set the task to be killed */
+#define PF_OPPO_KILLING	0x00000001
+#endif
 #define PF_EXITING	0x00000004	/* getting shut down */
+#define PF_EXITPIDONE	0x00000008	/* pi exit done on shut down */
 #define PF_VCPU		0x00000010	/* I'm a virtual CPU */
 #define PF_WQ_WORKER	0x00000020	/* I'm a workqueue worker */
 #define PF_FORKNOEXEC	0x00000040	/* forked but didn't exec */
@@ -2451,11 +2719,24 @@ extern void thread_group_cputime_adjusted(struct task_struct *p, cputime_t *ut, 
 #define PF_KTHREAD	0x00200000	/* I am a kernel thread */
 #define PF_RANDOMIZE	0x00400000	/* randomize virtual address space */
 #define PF_SWAPWRITE	0x00800000	/* Allowed to write to swap */
+#if defined(VENDOR_EDIT) && defined(CONFIG_PROCESS_RECLAIM)
+/* Kui.Zhang@PSW.BSP.Kernel.Performance, 2018-12-25,
+ * flag that current task is process reclaimer
+ */
+#define PF_RECLAIM_SHRINK 0x01000000
+#endif
 #define PF_NO_SETAFFINITY 0x04000000	/* Userland is not allowed to meddle with cpus_allowed */
 #define PF_MCE_EARLY    0x08000000      /* Early kill for mce process policy */
 #define PF_MUTEX_TESTER	0x20000000	/* Thread belongs to the rt mutex tester */
 #define PF_FREEZER_SKIP	0x40000000	/* Freezer should not count it as freezable */
 #define PF_SUSPEND_TASK 0x80000000      /* this thread called freeze_processes and should not be frozen */
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_PROCESS_RECLAIM)
+/* Kui.Zhang@PSW.BSP.Kernel.Performance, 2018-12-25,
+ * check current task is process reclaimer?
+ */
+#define current_is_reclaimer() (current->flags & PF_RECLAIM_SHRINK)
+#endif
 
 /*
  * Only the _current_ task can read/write to tsk->flags, but other
@@ -2511,8 +2792,6 @@ static inline void memalloc_noio_restore(unsigned int flags)
 #define PFA_LMK_WAITING  3      /* Lowmemorykiller is waiting */
 #define PFA_SPEC_SSB_DISABLE		4	/* Speculative Store Bypass disabled */
 #define PFA_SPEC_SSB_FORCE_DISABLE	5	/* Speculative Store Bypass force disabled*/
-#define PFA_SPEC_IB_DISABLE		6	/* Indirect branch speculation restricted */
-#define PFA_SPEC_IB_FORCE_DISABLE	7	/* Indirect branch speculation permanently restricted */
 
 
 #define TASK_PFA_TEST(name, func)					\
@@ -2545,13 +2824,6 @@ TASK_PFA_CLEAR(SPEC_SSB_DISABLE, spec_ssb_disable)
 
 TASK_PFA_TEST(SPEC_SSB_FORCE_DISABLE, spec_ssb_force_disable)
 TASK_PFA_SET(SPEC_SSB_FORCE_DISABLE, spec_ssb_force_disable)
-
-TASK_PFA_TEST(SPEC_IB_DISABLE, spec_ib_disable)
-TASK_PFA_SET(SPEC_IB_DISABLE, spec_ib_disable)
-TASK_PFA_CLEAR(SPEC_IB_DISABLE, spec_ib_disable)
-
-TASK_PFA_TEST(SPEC_IB_FORCE_DISABLE, spec_ib_force_disable)
-TASK_PFA_SET(SPEC_IB_FORCE_DISABLE, spec_ib_force_disable)
 
 /*
  * task->jobctl flags
@@ -2646,6 +2918,13 @@ static inline void calc_load_exit_idle(void) { }
  * Please use one of the three interfaces below.
  */
 extern unsigned long long notrace sched_clock(void);
+
+/*
+ * alternative sched_clock to get arch_timer cycle as well
+ */
+extern unsigned long long notrace
+sched_clock_get_cyc(unsigned long long *cyc_ret);
+
 /*
  * See the comment in kernel/sched/clock.c
  */
@@ -3109,10 +3388,8 @@ extern struct mm_struct *get_task_mm(struct task_struct *task);
  * succeeds.
  */
 extern struct mm_struct *mm_access(struct task_struct *task, unsigned int mode);
-/* Remove the current tasks stale references to the old mm_struct on exit() */
-extern void exit_mm_release(struct task_struct *, struct mm_struct *);
-/* Remove the current tasks stale references to the old mm_struct on exec() */
-extern void exec_mm_release(struct task_struct *, struct mm_struct *);
+/* Remove the current tasks stale references to the old mm_struct */
+extern void mm_release(struct task_struct *, struct mm_struct *);
 
 #ifdef CONFIG_HAVE_COPY_THREAD_TLS
 extern int copy_thread_tls(unsigned long, unsigned long, unsigned long,
@@ -3138,6 +3415,38 @@ extern void exit_thread(struct task_struct *tsk);
 static inline void exit_thread(struct task_struct *tsk)
 {
 }
+#endif
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_ELSA_STUB)
+//zhoumingjun@Swdp.shanghai, 2017/04/19, add process_event_notifier support
+#define PROCESS_EVENT_CREATE 1
+#define PROCESS_EVENT_EXIT 2
+#define PROCESS_EVENT_UID 3
+#define PROCESS_EVENT_SOCKET 4
+#define PROCESS_EVENT_BINDER 5
+#define PROCESS_EVENT_BINDER_NO_WORK 6
+#define PROCESS_EVENT_SIGNAL_FROZEN 7
+
+#define BINDER_DESCRIPTOR_SIZE	70
+struct process_event_data {
+    pid_t pid;
+    kuid_t uid;
+    kuid_t old_uid;
+    long reason;
+    long reason2;
+    __u32 binder_flag;
+    int freeze_binder_count;
+    char buf[BINDER_DESCRIPTOR_SIZE];
+    void *priv;
+};
+extern int process_event_register_notifier(struct notifier_block *nb);
+extern int process_event_unregister_notifier(struct notifier_block *nb);
+extern int process_event_notifier_call_chain(unsigned long action, struct process_event_data *pe_data);
+
+//zhoumingjun@Swdp.shanghai, 2017/07/06, add process_event_notifier_atomic support
+extern int process_event_register_notifier_atomic(struct notifier_block *nb);
+extern int process_event_unregister_notifier_atomic(struct notifier_block *nb);
+extern int process_event_notifier_call_chain_atomic(unsigned long action, struct process_event_data *pe_data);
 #endif
 
 extern void exit_files(struct task_struct *);
@@ -3214,6 +3523,41 @@ extern bool current_is_single_threaded(void);
 #define for_each_process_thread(p, t)	\
 	for_each_process(p) for_each_thread(p, t)
 
+#ifdef VENDOR_EDIT
+#ifdef CONFIG_OPPO_FG_OPT
+/* Huacai.Zhou@PSW.BSP.Kernel.MM, 2018-07-07, add fg process opt*/
+extern bool is_fg(int uid);
+static inline int current_is_fg(void)
+{
+	int cur_uid;
+	cur_uid = current_uid().val;
+	if (is_fg(cur_uid))
+		return 1;
+	return 0;
+}
+
+/* Kui.Zhang@PSW.BSP.Kernel.MM, 2018-12-25, check whether task is fg*/
+static inline int task_is_fg(struct task_struct *task)
+{
+	int task_uid;
+	task_uid = task_uid(task).val;
+	if (is_fg(task_uid))
+		return 1;
+	return 0;
+}
+#else
+static inline int current_is_fg(void)
+{
+	return 0;
+}
+
+static inline int task_is_fg(struct task_struct *task)
+{
+	return 0;
+}
+#endif /*CONFIG_OPPO_FG_OPT*/
+#endif /*VENDOR_EDIT*/
+
 static inline int get_nr_threads(struct task_struct *tsk)
 {
 	return tsk->signal->nr_threads;
@@ -3259,7 +3603,7 @@ static inline int thread_group_empty(struct task_struct *p)
  * Protects ->fs, ->files, ->mm, ->group_info, ->comm, keyring
  * subscriptions and synchronises with wait4().  Also used in procfs.  Also
  * pins the final release of task.io_context.  Also protects ->cpuset and
- * ->cgroup.subsys[]. And ->vfork_done. And ->sysvshm.shm_clist.
+ * ->cgroup.subsys[]. And ->vfork_done.
  *
  * Nests both inside and outside of read_lock(&tasklist_lock).
  * It must not be nested with write_lock_irq(&tasklist_lock),
@@ -3491,6 +3835,17 @@ static inline int fatal_signal_pending(struct task_struct *p)
 {
 	return signal_pending(p) && __fatal_signal_pending(p);
 }
+
+//#ifdef VENDOR_EDIT //fangpan@Swdp.shanghai,2015/11/12
+static inline int hung_long_and_fatal_signal_pending(struct task_struct *p)
+{
+#ifdef CONFIG_DETECT_HUNG_TASK
+	return fatal_signal_pending(p) && (p->flags & PF_OPPO_KILLING);
+#else
+	return 0;
+#endif
+}
+//#endif
 
 static inline int signal_pending_state(long state, struct task_struct *p)
 {
@@ -3797,6 +4152,16 @@ static inline unsigned long rlimit_max(unsigned int limit)
 	return task_rlimit_max(current, limit);
 }
 
+#ifdef VENDOR_EDIT
+// Liujie.Xie@TECH.Kernel.Sched, 2019/05/22, add for ui first
+extern bool is_inherit_top_app(struct task_struct *p);
+
+#define INHERIT_DEPTH 2
+extern void set_inherit_top_app(struct task_struct *p,
+					struct task_struct *from);
+extern void restore_inherit_top_app(struct task_struct *p);
+#endif /* VENDOR_EDIT */
+
 #define SCHED_CPUFREQ_RT	(1U << 0)
 #define SCHED_CPUFREQ_DL	(1U << 1)
 #define SCHED_CPUFREQ_IOWAIT	(1U << 2)
@@ -3814,4 +4179,5 @@ void cpufreq_add_update_util_hook(int cpu, struct update_util_data *data,
 void cpufreq_remove_update_util_hook(int cpu);
 #endif /* CONFIG_CPU_FREQ */
 
+#include <linux/sched/sched.h>
 #endif

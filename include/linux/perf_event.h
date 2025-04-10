@@ -455,11 +455,6 @@ struct pmu {
 	 * Filter events for PMU-specific reasons.
 	 */
 	int (*filter_match)		(struct perf_event *event); /* optional */
-
-	/*
-	 * Check period value for PERF_EVENT_IOC_PERIOD ioctl.
-	 */
-	int (*check_period)		(struct perf_event *event, u64 value); /* optional */
 };
 
 /**
@@ -475,7 +470,7 @@ struct pmu {
  */
 struct perf_addr_filter {
 	struct list_head	entry;
-	struct path		path;
+	struct inode		*inode;
 	unsigned long		offset;
 	unsigned long		size;
 	unsigned int		range	: 1,
