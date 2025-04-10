@@ -59,6 +59,29 @@ static int memblock_can_resize __initdata_memblock;
 static int memblock_memory_in_slab __initdata_memblock = 0;
 static int memblock_reserved_in_slab __initdata_memblock = 0;
 
+//#ifdef VENDOR_EDIT
+//Wen.Luo@BSP.Kernel.Stability, 2018/11/28, Enable slabtrace for ageing test
+#if defined(CONFIG_MTK_MEMCFG) && defined(CONFIG_SLUB_DEBUG)
+//#else
+//#if defined(CONFIG_MTK_MEMCFG) && defined(CONFIG_MTK_ENG_BUILD)
+//#endif
+struct memblock_record memblock_record[MAX_MEMBLOCK_RECORD];
+struct memblock_stack_trace memblock_stack_trace[MAX_MEMBLOCK_RECORD];
+int memblock_reserve_count;
+
+inline void init_memblock_stack_trace(struct memblock_stack_trace *mst,
+		struct stack_trace *trace, unsigned long size, int skip)
+{
+	memset(mst->addrs, 0, MAX_MEMBLOCK_TRACK_DEPTH);
+	mst->size = size;
+	mst->merge = 0;
+	trace->nr_entries = 0;
+	trace->max_entries = MAX_MEMBLOCK_TRACK_DEPTH;
+	trace->skip = skip;
+	trace->entries = mst->addrs;
+}
+#endif
+
 ulong __init_memblock choose_memblock_flags(void)
 {
 	return system_has_some_mirror ? MEMBLOCK_MIRROR : MEMBLOCK_NONE;
@@ -186,6 +209,14 @@ __memblock_find_range_top_down(phys_addr_t start, phys_addr_t end,
  *
  * Find @size free area aligned to @align in the specified range and node.
  *
+ * When allocation direction is bottom-up, the @start should be greater
+ * than the end of the kernel image. Otherwise, it will be trimmed. The
+ * reason is that we want the bottom-up allocation just near the kernel
+ * image so it is highly likely that the allocated memory and the kernel
+ * will reside in the same node.
+ *
+ * If bottom-up allocation failed, will try to allocate memory top-down.
+ *
  * RETURNS:
  * Found address on success, 0 on failure.
  */
@@ -193,6 +224,8 @@ phys_addr_t __init_memblock memblock_find_in_range_node(phys_addr_t size,
 					phys_addr_t align, phys_addr_t start,
 					phys_addr_t end, int nid, ulong flags)
 {
+	phys_addr_t kernel_end, ret;
+
 	/* pump up @end */
 	if (end == MEMBLOCK_ALLOC_ACCESSIBLE)
 		end = memblock.current_limit;
@@ -200,13 +233,39 @@ phys_addr_t __init_memblock memblock_find_in_range_node(phys_addr_t size,
 	/* avoid allocating the first page */
 	start = max_t(phys_addr_t, start, PAGE_SIZE);
 	end = max(start, end);
+	kernel_end = __pa_symbol(_end);
 
-	if (memblock_bottom_up())
-		return __memblock_find_range_bottom_up(start, end, size, align,
-						       nid, flags);
-	else
-		return __memblock_find_range_top_down(start, end, size, align,
-						      nid, flags);
+	/*
+	 * try bottom-up allocation only when bottom-up mode
+	 * is set and @end is above the kernel image.
+	 */
+	if (memblock_bottom_up() && end > kernel_end) {
+		phys_addr_t bottom_up_start;
+
+		/* make sure we will allocate above the kernel */
+		bottom_up_start = max(start, kernel_end);
+
+		/* ok, try bottom-up allocation first */
+		ret = __memblock_find_range_bottom_up(bottom_up_start, end,
+						      size, align, nid, flags);
+		if (ret)
+			return ret;
+
+		/*
+		 * we always limit bottom-up allocation above the kernel,
+		 * but top-down allocation doesn't have the limit, so
+		 * retrying top-down allocation may succeed when bottom-up
+		 * allocation failed.
+		 *
+		 * bottom-up allocation is expected to be fail very rarely,
+		 * so we use WARN_ONCE() here to see the stack trace if
+		 * fail happens.
+		 */
+		WARN_ONCE(1, "memblock: bottom-up allocation failed, memory hotunplug may be affected\n");
+	}
+
+	return __memblock_find_range_top_down(start, end, size, align, nid,
+					      flags);
 }
 
 /**
@@ -672,6 +731,7 @@ static int __init_memblock memblock_remove_range(struct memblock_type *type,
 
 int __init_memblock memblock_remove(phys_addr_t base, phys_addr_t size)
 {
+	kmemleak_free_part(__va(base), size);
 	return memblock_remove_range(&memblock.memory, base, size);
 }
 
@@ -687,14 +747,51 @@ int __init_memblock memblock_free(phys_addr_t base, phys_addr_t size)
 	return memblock_remove_range(&memblock.reserved, base, size);
 }
 
-int __init_memblock memblock_reserve(phys_addr_t base, phys_addr_t size)
+static int __init_memblock memblock_reserve_region(phys_addr_t base,
+						   phys_addr_t size,
+						   int nid,
+						   unsigned long flags)
 {
+	struct memblock_type *_rgn = &memblock.reserved;
+
 	memblock_dbg("memblock_reserve: [%#016llx-%#016llx] flags %#02lx %pF\n",
 		     (unsigned long long)base,
 		     (unsigned long long)base + size - 1,
-		     0UL, (void *)_RET_IP_);
+		     flags, (void *)_RET_IP_);
 
-	return memblock_add_range(&memblock.reserved, base, size, MAX_NUMNODES, 0);
+//#ifdef VENDOR_EDIT
+//Wen.Luo@BSP.Kernel.Stability, 2018/11/28, Enable slabtrace for ageing test
+#if defined(CONFIG_MTK_MEMCFG) && defined(CONFIG_SLUB_DEBUG)
+//#else
+//#if defined(CONFIG_MTK_MEMCFG) && defined(CONFIG_MTK_ENG_BUILD)
+//#endif
+	if (memblock_reserve_count < MAX_MEMBLOCK_RECORD) {
+		struct stack_trace trace;
+
+		memblock_record[memblock_reserve_count].base = base;
+		memblock_record[memblock_reserve_count].end = base + size - 1;
+		memblock_record[memblock_reserve_count].size = size;
+		memblock_record[memblock_reserve_count].flags = flags;
+		memblock_record[memblock_reserve_count].ip =
+			(unsigned long) _RET_IP_;
+
+		init_memblock_stack_trace(
+			&memblock_stack_trace[memblock_reserve_count],
+			&trace, (unsigned long)size, 0);
+
+		save_stack_trace_tsk(current, &trace);
+		memblock_stack_trace[memblock_reserve_count].count =
+			trace.nr_entries;
+	}
+	memblock_reserve_count++;
+#endif
+
+	return memblock_add_range(_rgn, base, size, nid, flags);
+}
+
+int __init_memblock memblock_reserve(phys_addr_t base, phys_addr_t size)
+{
+	return memblock_reserve_region(base, size, MAX_NUMNODES, 0);
 }
 
 /**

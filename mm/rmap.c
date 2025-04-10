@@ -65,11 +65,42 @@
 #include <asm/tlbflush.h>
 
 #include <trace/events/tlb.h>
+#include <linux/kasan.h>
 
 #include "internal.h"
 
 static struct kmem_cache *anon_vma_cachep;
 static struct kmem_cache *anon_vma_chain_cachep;
+
+/*
+ * is_anon_vma_type:
+ * tell if a anon_vma object is the anon_vma type.
+ * Although anon_vma_cachep is SLAB_TYPESAFE_BY_RCU, it is possible
+ * to be freed and re-used as another type of object outsize the
+ * grace period.
+ *
+ * So test is_anon_vma_type() within the grace period, if
+ * is_anon_vma_type() returns FALSE, it means the object may be re-used
+ * as another type of object; is is_anon_vma_type() returns TRUE,
+ * if means the object is anon_vma type ans since anon_vma_cachep is
+ * SLAB_TYPESAFE_BY_RCU, the type will not be changed within the
+ * grace period.
+ *
+ * NOTE:
+ * It is still an use-aftre-free while testing anon_vma->private, add
+ * kasasn_disable_current()/kasan_enable_current() to bypass this case.
+ */
+static bool is_anon_vma_type(struct anon_vma *anon_vma)
+{
+	bool ret;
+
+	kasan_disable_current();
+	ret = (unsigned long)anon_vma_cachep == anon_vma->private;
+	kasan_enable_current();
+
+	return ret;
+}
+
 
 static inline struct anon_vma *anon_vma_alloc(void)
 {
@@ -85,6 +116,8 @@ static inline struct anon_vma *anon_vma_alloc(void)
 		 * from fork, the root will be reset to the parents anon_vma.
 		 */
 		anon_vma->root = anon_vma;
+		/* set key */
+		anon_vma->private = (unsigned long)anon_vma_cachep;
 	}
 
 	return anon_vma;
@@ -116,6 +149,13 @@ static inline void anon_vma_free(struct anon_vma *anon_vma)
 		anon_vma_lock_write(anon_vma);
 		anon_vma_unlock_write(anon_vma);
 	}
+
+	/*
+	 * unset key, if the anon_vma is freed and re-used as
+	 * another type of object outside the grace period, we
+	 * can tell if this happened.
+	 */
+	anon_vma->private = 0;
 
 	kmem_cache_free(anon_vma_cachep, anon_vma);
 }
@@ -471,6 +511,12 @@ struct anon_vma *page_get_anon_vma(struct page *page)
 		goto out;
 
 	anon_vma = (struct anon_vma *) (anon_mapping - PAGE_MAPPING_ANON);
+
+	if (!is_anon_vma_type(anon_vma)) {
+		anon_vma = NULL;
+		goto out;
+	}
+
 	if (!atomic_inc_not_zero(&anon_vma->refcount)) {
 		anon_vma = NULL;
 		goto out;
@@ -515,7 +561,19 @@ struct anon_vma *page_lock_anon_vma_read(struct page *page)
 		goto out;
 
 	anon_vma = (struct anon_vma *) (anon_mapping - PAGE_MAPPING_ANON);
+
+	if (!is_anon_vma_type(anon_vma)) {
+		anon_vma = NULL;
+		goto out;
+	}
+
 	root_anon_vma = READ_ONCE(anon_vma->root);
+
+	if (!is_anon_vma_type(root_anon_vma)) {
+		anon_vma = NULL;
+		goto out;
+	}
+
 	if (down_read_trylock(&root_anon_vma->rwsem)) {
 		/*
 		 * If the page is still mapped, then this anon_vma is still
@@ -1476,9 +1534,6 @@ static int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 	pte_t pteval;
 	spinlock_t *ptl;
 	int ret = SWAP_AGAIN;
-	unsigned long sh_address;
-	bool pmd_sharing_possible = false;
-	unsigned long spmd_start, spmd_end;
 	struct rmap_private *rp = arg;
 	enum ttu_flags flags = rp->flags;
 
@@ -1492,32 +1547,6 @@ static int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 		/* check if we have anything to do after split */
 		if (page_mapcount(page) == 0)
 			goto out;
-	}
-
-	/*
-	 * Only use the range_start/end mmu notifiers if huge pmd sharing
-	 * is possible.  In the normal case, mmu_notifier_invalidate_page
-	 * is sufficient as we only unmap a page.  However, if we unshare
-	 * a pmd, we will unmap a PUD_SIZE range.
-	 */
-	if (PageHuge(page)) {
-		spmd_start = address;
-		spmd_end = spmd_start + vma_mmu_pagesize(vma);
-
-		/*
-		 * Check if pmd sharing is possible.  If possible, we could
-		 * unmap a PUD_SIZE range.  spmd_start/spmd_end will be
-		 * modified if sharing is possible.
-		 */
-		adjust_range_if_pmd_sharing_possible(vma, &spmd_start,
-								&spmd_end);
-		if (spmd_end - spmd_start != vma_mmu_pagesize(vma)) {
-			sh_address = address;
-
-			pmd_sharing_possible = true;
-			mmu_notifier_invalidate_range_start(vma->vm_mm,
-							spmd_start, spmd_end);
-		}
 	}
 
 	pte = page_check_address(page, mm, address, &ptl,
@@ -1552,30 +1581,6 @@ static int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 			goto out_unmap;
 		}
   	}
-
-	/*
-	 * Call huge_pmd_unshare to potentially unshare a huge pmd.  Pass
-	 * sh_address as it will be modified if unsharing is successful.
-	 */
-	if (PageHuge(page) && huge_pmd_unshare(mm, &sh_address, pte)) {
-		/*
-		 * huge_pmd_unshare unmapped an entire PMD page.  There is
-		 * no way of knowing exactly which PMDs may be cached for
-		 * this mm, so flush them all.  spmd_start/spmd_end cover
-		 * this PUD_SIZE range.
-		 */
-		flush_cache_range(vma, spmd_start, spmd_end);
-		flush_tlb_range(vma, spmd_start, spmd_end);
-
-		/*
-		 * The ref count of the PMD page was dropped which is part
-		 * of the way map counting is done for shared PMDs.  When
-		 * there is no other sharing, huge_pmd_unshare returns false
-		 * and we will unmap the actual page and drop map count
-		 * to zero.
-		 */
-		goto out_unmap;
-	}
 
 	/* Nuke the page table entry. */
 	flush_cache_page(vma, address, page_to_pfn(page));
@@ -1674,9 +1679,6 @@ out_unmap:
 	if (ret != SWAP_FAIL && ret != SWAP_MLOCK && !(flags & TTU_MUNLOCK))
 		mmu_notifier_invalidate_page(mm, address);
 out:
-	if (pmd_sharing_possible)
-		mmu_notifier_invalidate_range_end(vma->vm_mm,
-							spmd_start, spmd_end);
 	return ret;
 }
 
@@ -1704,6 +1706,29 @@ static int page_mapcount_is_zero(struct page *page)
 	return !page_mapcount(page);
 }
 
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_PROCESS_RECLAIM)
+/* Kui.Zhang@PSW.TEC.Kernel.Performance. 2019/01/16,
+ * Support reclaim the special vma(if target_vma not NULL)
+ * try_to_unmap - try to remove all page table mappings to a page
+ * @page: the page to get unmapped
+ * @flags: action and flags
+ * @vma : target vma for reclaim
+ *
+ * Tries to remove all the page table entries which are mapping this
+ * page, used in the pageout path.  Caller must hold the page lock.
+ * If @vma is not NULL, this function try to remove @page from only @vma
+ * without peeking all mapped vma for @page.
+ * Return values are:
+ *
+ * SWAP_SUCCESS	- we succeeded in removing all mappings
+ * SWAP_AGAIN	- we missed a mapping, try again later
+ * SWAP_FAIL	- the page is unswappable
+ * SWAP_MLOCK	- page is mlocked.
+ */
+int try_to_unmap(struct page *page, enum ttu_flags flags,
+		struct vm_area_struct *vma)
+#else
 /**
  * try_to_unmap - try to remove all page table mappings to a page
  * @page: the page to get unmapped
@@ -1719,6 +1744,7 @@ static int page_mapcount_is_zero(struct page *page)
  * SWAP_MLOCK	- page is mlocked.
  */
 int try_to_unmap(struct page *page, enum ttu_flags flags)
+#endif
 {
 	int ret;
 	struct rmap_private rp = {
@@ -1731,6 +1757,12 @@ int try_to_unmap(struct page *page, enum ttu_flags flags)
 		.arg = &rp,
 		.done = page_mapcount_is_zero,
 		.anon_lock = page_lock_anon_vma_read,
+#if defined(VENDOR_EDIT) && defined(CONFIG_PROCESS_RECLAIM)
+		/* Kui.Zhang@PSW.TEC.Kernel.Performance. 2019/01/16,
+		 * Record the vma
+		 */
+		.target_vma = vma,
+#endif
 	};
 
 	/*
@@ -1790,7 +1822,12 @@ int try_to_munlock(struct page *page)
 		.arg = &rp,
 		.done = page_not_mapped,
 		.anon_lock = page_lock_anon_vma_read,
-
+#if defined(VENDOR_EDIT) && defined(CONFIG_PROCESS_RECLAIM)
+		/* Kui.Zhang@PSW.TEC.Kernel.Performance. 2019/01/16,
+		 * Record the vma
+		 */
+		.target_vma = NULL,
+#endif
 	};
 
 	VM_BUG_ON_PAGE(!PageLocked(page) || PageLRU(page), page);
@@ -1851,6 +1888,16 @@ static int rmap_walk_anon(struct page *page, struct rmap_walk_control *rwc,
 	pgoff_t pgoff;
 	struct anon_vma_chain *avc;
 	int ret = SWAP_AGAIN;
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_PROCESS_RECLAIM)
+	/* Kui.Zhang@PSW.TEC.Kernel.Performance. 2019/01/16,
+	 * Doing relcaim of the special vma
+	 */
+	if (rwc->target_vma) {
+		unsigned long address = vma_address(page, rwc->target_vma);
+		return rwc->rmap_one(page, rwc->target_vma, address, rwc->arg);
+	}
+#endif
 
 	if (locked) {
 		anon_vma = page_anon_vma(page);
@@ -1919,6 +1966,18 @@ static int rmap_walk_file(struct page *page, struct rmap_walk_control *rwc,
 	pgoff = page_to_pgoff(page);
 	if (!locked)
 		i_mmap_lock_read(mapping);
+
+#if defined(VENDOR_EDIT) && defined(CONFIG_PROCESS_RECLAIM)
+	/* Kui.Zhang@PSW.TEC.Kernel.Performance. 2019/01/16,
+	 * Doing relcaim of the special vma
+	 */
+	if (rwc->target_vma) {
+		unsigned long address = vma_address(page, rwc->target_vma);
+		ret = rwc->rmap_one(page, rwc->target_vma, address, rwc->arg);
+		goto done;
+	}
+#endif
+
 	vma_interval_tree_foreach(vma, &mapping->i_mmap, pgoff, pgoff) {
 		unsigned long address = vma_address(page, vma);
 

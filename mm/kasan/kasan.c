@@ -90,14 +90,7 @@ void kasan_unpoison_task_stack(struct task_struct *task)
 /* Unpoison the stack for the current task beyond a watermark sp value. */
 asmlinkage void kasan_unpoison_task_stack_below(const void *watermark)
 {
-	/*
-	 * Calculate the task stack base address.  Avoid using 'current'
-	 * because this function is called by early resume code which hasn't
-	 * yet set up the percpu register (%gs).
-	 */
-	void *base = (void *)((unsigned long)watermark & ~(THREAD_SIZE - 1));
-
-	kasan_unpoison_shadow(base, watermark - base);
+	__kasan_unpoison_stack(current, watermark);
 }
 
 /*
@@ -170,7 +163,10 @@ static __always_inline bool memory_is_poisoned_4(unsigned long addr)
 		 */
 		if (likely(((addr + 3) & KASAN_SHADOW_MASK) >= 3))
 			return false;
-
+#ifdef CONFIG_KASAN_ENHANCEMENT
+		if (likely(IS_ALIGNED(addr, KASAN_SHADOW_SCALE_SIZE)))
+			return false;
+#endif
 		return unlikely(*(u8 *)shadow_addr);
 	}
 
@@ -192,6 +188,10 @@ static __always_inline bool memory_is_poisoned_8(unsigned long addr)
 		 */
 		if (likely(IS_ALIGNED(addr, KASAN_SHADOW_SCALE_SIZE)))
 			return false;
+#ifdef CONFIG_KASAN_ENHANCEMENT
+		if (likely(((addr + 7) & KASAN_SHADOW_MASK) >= 7))
+			return false;
+#endif
 
 		return unlikely(*(u8 *)shadow_addr);
 	}
@@ -201,12 +201,20 @@ static __always_inline bool memory_is_poisoned_8(unsigned long addr)
 
 static __always_inline bool memory_is_poisoned_16(unsigned long addr)
 {
+#ifdef CONFIG_KASAN_ENHANCEMENT
+	u16 *shadow_addr = (u16 *)kasan_mem_to_shadow((void *)addr);
+#else
 	u32 *shadow_addr = (u32 *)kasan_mem_to_shadow((void *)addr);
+#endif
 
 	if (unlikely(*shadow_addr)) {
+#ifdef CONFIG_KASAN_ENHANCEMENT
+		if (memory_is_poisoned_1(addr + 15))
+#else
 		u16 shadow_first_bytes = *(u16 *)shadow_addr;
 
 		if (unlikely(shadow_first_bytes))
+#endif
 			return true;
 
 		/*
@@ -678,13 +686,12 @@ void kasan_kfree_large(const void *ptr)
 int kasan_module_alloc(void *addr, size_t size)
 {
 	void *ret;
-	size_t scaled_size;
 	size_t shadow_size;
 	unsigned long shadow_start;
 
 	shadow_start = (unsigned long)kasan_mem_to_shadow(addr);
-	scaled_size = (size + KASAN_SHADOW_MASK) >> KASAN_SHADOW_SCALE_SHIFT;
-	shadow_size = round_up(scaled_size, PAGE_SIZE);
+	shadow_size = round_up(size >> KASAN_SHADOW_SCALE_SHIFT,
+			PAGE_SIZE);
 
 	if (WARN_ON(!PAGE_ALIGNED(shadow_start)))
 		return -EINVAL;
