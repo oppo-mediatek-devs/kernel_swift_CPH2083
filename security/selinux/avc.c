@@ -349,26 +349,26 @@ static struct avc_xperms_decision_node
 	struct extended_perms_decision *xpd;
 
 	xpd_node = kmem_cache_zalloc(avc_xperms_decision_cachep,
-				     GFP_NOWAIT | __GFP_NOWARN);
+				GFP_ATOMIC | __GFP_NOMEMALLOC);
 	if (!xpd_node)
 		return NULL;
 
 	xpd = &xpd_node->xpd;
 	if (which & XPERMS_ALLOWED) {
 		xpd->allowed = kmem_cache_zalloc(avc_xperms_data_cachep,
-						GFP_NOWAIT | __GFP_NOWARN);
+						GFP_ATOMIC | __GFP_NOMEMALLOC);
 		if (!xpd->allowed)
 			goto error;
 	}
 	if (which & XPERMS_AUDITALLOW) {
 		xpd->auditallow = kmem_cache_zalloc(avc_xperms_data_cachep,
-						GFP_NOWAIT | __GFP_NOWARN);
+						GFP_ATOMIC | __GFP_NOMEMALLOC);
 		if (!xpd->auditallow)
 			goto error;
 	}
 	if (which & XPERMS_DONTAUDIT) {
 		xpd->dontaudit = kmem_cache_zalloc(avc_xperms_data_cachep,
-						GFP_NOWAIT | __GFP_NOWARN);
+						GFP_ATOMIC | __GFP_NOMEMALLOC);
 		if (!xpd->dontaudit)
 			goto error;
 	}
@@ -396,7 +396,8 @@ static struct avc_xperms_node *avc_xperms_alloc(void)
 {
 	struct avc_xperms_node *xp_node;
 
-	xp_node = kmem_cache_zalloc(avc_xperms_cachep, GFP_NOWAIT | __GFP_NOWARN);
+	xp_node = kmem_cache_zalloc(avc_xperms_cachep,
+				GFP_ATOMIC|__GFP_NOMEMALLOC);
 	if (!xp_node)
 		return xp_node;
 	INIT_LIST_HEAD(&xp_node->xpd_head);
@@ -549,7 +550,7 @@ static struct avc_node *avc_alloc_node(void)
 {
 	struct avc_node *node;
 
-	node = kmem_cache_zalloc(avc_node_cachep, GFP_NOWAIT | __GFP_NOWARN);
+	node = kmem_cache_zalloc(avc_node_cachep, GFP_ATOMIC|__GFP_NOMEMALLOC);
 	if (!node)
 		goto out;
 
@@ -733,6 +734,21 @@ static void avc_audit_post_callback(struct audit_buffer *ab, void *a)
 	if (ad->selinux_audit_data->denied) {
 		audit_log_format(ab, " permissive=%u",
 				 ad->selinux_audit_data->result ? 0 : 1);
+#ifdef CONFIG_MTK_SELINUX_AEE_WARNING
+		{
+			struct nlmsghdr *nlh;
+			char *selinux_data;
+
+			if (ab) {
+				nlh = nlmsg_hdr(audit_get_skb(ab));
+				selinux_data = nlmsg_data(nlh);
+				if (nlh->nlmsg_type != AUDIT_EOE) {
+					if (nlh->nlmsg_type == 1400)
+						mtk_audit_hook(selinux_data);
+				}
+			}
+		}
+#endif
 	}
 }
 
@@ -866,7 +882,7 @@ static int avc_update_node(u32 event, u32 perms, u8 driver, u8 xperm, u32 ssid,
 	if (orig->ae.xp_node) {
 		rc = avc_xperms_populate(node, orig->ae.xp_node);
 		if (rc) {
-			avc_node_kill(node);
+			kmem_cache_free(avc_node_cachep, node);
 			goto out_unlock;
 		}
 	}
