@@ -17,8 +17,6 @@
  * 08/12/11 beckyb	Add highmem support
  */
 
-#define pr_fmt(fmt) "software IO TLB: " fmt
-
 #include <linux/cache.h>
 #include <linux/dma-mapping.h>
 #include <linux/mm.h>
@@ -149,16 +147,20 @@ static bool no_iotlb_memory;
 void swiotlb_print_info(void)
 {
 	unsigned long bytes = io_tlb_nslabs << IO_TLB_SHIFT;
+	unsigned char *vstart, *vend;
 
 	if (no_iotlb_memory) {
-		pr_warn("No low mem\n");
+		pr_warn("software IO TLB: No low mem\n");
 		return;
 	}
 
-	pr_info("mapped [mem %#010llx-%#010llx] (%luMB)\n",
+	vstart = phys_to_virt(io_tlb_start);
+	vend = phys_to_virt(io_tlb_end);
+
+	printk(KERN_INFO "software IO TLB [mem %#010llx-%#010llx] (%luMB) mapped at [%p-%p]\n",
 	       (unsigned long long)io_tlb_start,
 	       (unsigned long long)io_tlb_end,
-	       bytes >> 20);
+	       bytes >> 20, vstart, vend - 1);
 }
 
 int __init swiotlb_init_with_tbl(char *tlb, unsigned long nslabs, int verbose)
@@ -199,7 +201,6 @@ int __init swiotlb_init_with_tbl(char *tlb, unsigned long nslabs, int verbose)
 		io_tlb_orig_addr[i] = INVALID_PHYS_ADDR;
 	}
 	io_tlb_index = 0;
-	no_iotlb_memory = false;
 
 	if (verbose)
 		swiotlb_print_info();
@@ -230,12 +231,10 @@ swiotlb_init(int verbose)
 	if (vstart && !swiotlb_init_with_tbl(vstart, io_tlb_nslabs, verbose))
 		return;
 
-	if (io_tlb_start) {
+	if (io_tlb_start)
 		memblock_free_early(io_tlb_start,
 				    PAGE_ALIGN(io_tlb_nslabs << IO_TLB_SHIFT));
-		io_tlb_start = 0;
-	}
-	pr_warn("Cannot allocate buffer");
+	pr_warn("Cannot allocate SWIOTLB buffer");
 	no_iotlb_memory = true;
 }
 
@@ -277,8 +276,8 @@ swiotlb_late_init_with_default_size(size_t default_size)
 		return -ENOMEM;
 	}
 	if (order != get_order(bytes)) {
-		pr_warn("only able to allocate %ld MB\n",
-			(PAGE_SIZE << order) >> 20);
+		printk(KERN_WARNING "Warning: only able to allocate %ld MB "
+		       "for software IO TLB\n", (PAGE_SIZE << order) >> 20);
 		io_tlb_nslabs = SLABS_PER_PAGE << order;
 	}
 	rc = swiotlb_late_init_with_tbl(vstart, io_tlb_nslabs);
@@ -333,7 +332,6 @@ swiotlb_late_init_with_tbl(char *tlb, unsigned long nslabs)
 		io_tlb_orig_addr[i] = INVALID_PHYS_ADDR;
 	}
 	io_tlb_index = 0;
-	no_iotlb_memory = false;
 
 	swiotlb_print_info();
 
@@ -645,7 +643,7 @@ swiotlb_alloc_coherent(struct device *hwdev, size_t size,
 	dma_addr_t dev_addr;
 	void *ret;
 	int order = get_order(size);
-	u64 dma_mask = DMA_BIT_MASK(32);
+	u64 dma_mask = DMA_BIT_MASK(CONFIG_ARCH_DMA_BITS);
 
 	if (hwdev && hwdev->coherent_dma_mask)
 		dma_mask = hwdev->coherent_dma_mask;
@@ -693,7 +691,7 @@ swiotlb_alloc_coherent(struct device *hwdev, size_t size,
 	return ret;
 
 err_warn:
-	pr_warn("coherent allocation failed for device %s size=%zu\n",
+	pr_warn("swiotlb: coherent allocation failed for device %s size=%zu\n",
 		dev_name(hwdev), size);
 	dump_stack();
 
