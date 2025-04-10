@@ -380,20 +380,11 @@ static noinline int btrfs_ioctl_fitrim(struct file *file, void __user *arg)
 	struct fstrim_range range;
 	u64 minlen = ULLONG_MAX;
 	u64 num_devices = 0;
+	u64 total_bytes = btrfs_super_total_bytes(fs_info->super_copy);
 	int ret;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
-
-	/*
-	 * If the fs is mounted with nologreplay, which requires it to be
-	 * mounted in RO mode as well, we can not allow discard on free space
-	 * inside block groups, because log trees refer to extents that are not
-	 * pinned in a block group's free space cache (pinning the extents is
-	 * precisely the first phase of replaying a log tree).
-	 */
-	if (btrfs_test_opt(fs_info, NOLOGREPLAY))
-		return -EROFS;
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(device, &fs_info->fs_devices->devices,
@@ -413,15 +404,11 @@ static noinline int btrfs_ioctl_fitrim(struct file *file, void __user *arg)
 		return -EOPNOTSUPP;
 	if (copy_from_user(&range, arg, sizeof(range)))
 		return -EFAULT;
-
-	/*
-	 * NOTE: Don't truncate the range using super->total_bytes.  Bytenr of
-	 * block group is in the logical address space, which can be any
-	 * sectorsize aligned bytenr in  the range [0, U64_MAX].
-	 */
-	if (range.len < fs_info->sb->s_blocksize)
+	if (range.start > total_bytes ||
+	    range.len < fs_info->sb->s_blocksize)
 		return -EINVAL;
 
+	range.len = min(range.len, total_bytes - range.start);
 	range.minlen = max(range.minlen, minlen);
 	ret = btrfs_trim_fs(fs_info->tree_root, &range);
 	if (ret < 0)
@@ -557,6 +544,8 @@ static noinline int create_subvol(struct inode *dir,
 	btrfs_set_root_otransid(root_item, trans->transid);
 
 	btrfs_tree_unlock(leaf);
+	free_extent_buffer(leaf);
+	leaf = NULL;
 
 	btrfs_set_root_dirid(root_item, new_dirid);
 
@@ -565,22 +554,8 @@ static noinline int create_subvol(struct inode *dir,
 	key.type = BTRFS_ROOT_ITEM_KEY;
 	ret = btrfs_insert_root(trans, root->fs_info->tree_root, &key,
 				root_item);
-	if (ret) {
-		/*
-		 * Since we don't abort the transaction in this case, free the
-		 * tree block so that we don't leak space and leave the
-		 * filesystem in an inconsistent state (an extent item in the
-		 * extent tree without backreferences). Also no need to have
-		 * the tree block locked since it is not in any tree at this
-		 * point, so no other task can find it and use it.
-		 */
-		btrfs_free_tree_block(trans, root, leaf, 0, 1);
-		free_extent_buffer(leaf);
+	if (ret)
 		goto fail;
-	}
-
-	free_extent_buffer(leaf);
-	leaf = NULL;
 
 	key.offset = (u64)-1;
 	new_root = btrfs_read_fs_root_no_name(root->fs_info, &key);
@@ -622,18 +597,12 @@ static noinline int create_subvol(struct inode *dir,
 
 	btrfs_i_size_write(dir, dir->i_size + namelen * 2);
 	ret = btrfs_update_inode(trans, root, dir);
-	if (ret) {
-		btrfs_abort_transaction(trans, ret);
-		goto fail;
-	}
+	BUG_ON(ret);
 
 	ret = btrfs_add_root_ref(trans, root->fs_info->tree_root,
 				 objectid, root->root_key.objectid,
 				 btrfs_ino(dir), index, name, namelen);
-	if (ret) {
-		btrfs_abort_transaction(trans, ret);
-		goto fail;
-	}
+	BUG_ON(ret);
 
 	ret = btrfs_uuid_tree_add(trans, root->fs_info->uuid_root,
 				  root_item->uuid, BTRFS_UUID_KEY_SUBVOL,
@@ -2053,14 +2022,9 @@ static noinline int copy_to_sk(struct btrfs_path *path,
 		sh.len = item_len;
 		sh.transid = found_transid;
 
-		/*
-		 * Copy search result header. If we fault then loop again so we
-		 * can fault in the pages and -EFAULT there if there's a
-		 * problem. Otherwise we'll fault and then copy the buffer in
-		 * properly this next time through
-		 */
-		if (probe_user_write(ubuf + *sk_offset, &sh, sizeof(sh))) {
-			ret = 0;
+		/* copy search result header */
+		if (copy_to_user(ubuf + *sk_offset, &sh, sizeof(sh))) {
+			ret = -EFAULT;
 			goto out;
 		}
 
@@ -2068,14 +2032,10 @@ static noinline int copy_to_sk(struct btrfs_path *path,
 
 		if (item_len) {
 			char __user *up = ubuf + *sk_offset;
-			/*
-			 * Copy the item, same behavior as above, but reset the
-			 * * sk_offset so we copy the full thing again.
-			 */
-			if (read_extent_buffer_to_user_nofault(leaf, up,
-						item_off, item_len)) {
-				ret = 0;
-				*sk_offset -= sizeof(sh);
+			/* copy the item */
+			if (read_extent_buffer_to_user(leaf, up,
+						       item_off, item_len)) {
+				ret = -EFAULT;
 				goto out;
 			}
 
@@ -2163,11 +2123,6 @@ static noinline int search_ioctl(struct inode *inode,
 	key.offset = sk->min_offset;
 
 	while (1) {
-		ret = fault_in_pages_writeable(ubuf + sk_offset,
-					       *buf_size - sk_offset);
-		if (ret)
-			break;
-
 		ret = btrfs_search_forward(root, &key, path, sk->min_transid);
 		if (ret != 0) {
 			if (ret > 0)
@@ -3866,8 +3821,6 @@ process_slot:
 			ret = -EINTR;
 			goto out;
 		}
-
-		cond_resched();
 	}
 	ret = 0;
 
@@ -3958,17 +3911,9 @@ static noinline int btrfs_clone_files(struct file *file, struct file *file_src,
 		goto out_unlock;
 	if (len == 0)
 		olen = len = src->i_size - off;
-	/*
-	 * If we extend to eof, continue to block boundary if and only if the
-	 * destination end offset matches the destination file's size, otherwise
-	 * we would be corrupting data by placing the eof block into the middle
-	 * of a file.
-	 */
-	if (off + len == src->i_size) {
-		if (!IS_ALIGNED(len, bs) && destoff + len < inode->i_size)
-			goto out_unlock;
+	/* if we extend to eof, continue to block boundary */
+	if (off + len == src->i_size)
 		len = ALIGN(src->i_size, bs) - off;
-	}
 
 	if (len == 0) {
 		ret = 0;

@@ -20,6 +20,7 @@
 #include <linux/prefetch.h>
 #include <linux/uio.h>
 #include <linux/cleancache.h>
+#include <linux/hie.h>
 
 #include "f2fs.h"
 #include "node.h"
@@ -119,6 +120,9 @@ static void bio_post_read_processing(struct bio_post_read_ctx *ctx)
 
 static bool f2fs_bio_post_read_required(struct bio *bio)
 {
+	if (bio_encrypted(bio))
+		return false;
+
 	return bio->bi_private && !bio->bi_error;
 }
 
@@ -312,6 +316,7 @@ static void __submit_merged_bio(struct f2fs_bio_info *io)
 	else
 		trace_f2fs_prepare_write_bio(io->sbi->sb, fio->type, io->bio);
 
+	f2fs_set_bio_ctx_fio(fio, io->bio);
 	__submit_bio(io->sbi, io->bio, fio->type);
 	io->bio = NULL;
 }
@@ -438,10 +443,7 @@ int f2fs_submit_page_bio(struct f2fs_io_info *fio)
 	struct page *page = fio->encrypted_page ?
 			fio->encrypted_page : fio->page;
 
-	if (!f2fs_is_valid_blkaddr(fio->sbi, fio->new_blkaddr,
-			__is_meta_io(fio) ? META_GENERIC : DATA_GENERIC))
-		return -EFAULT;
-
+	verify_block_addr(fio, fio->new_blkaddr);
 	trace_f2fs_submit_page_bio(page, fio);
 	f2fs_trace_ios(fio, 0);
 
@@ -455,12 +457,59 @@ int f2fs_submit_page_bio(struct f2fs_io_info *fio)
 	}
 	bio_set_op_attrs(bio, fio->op, fio->op_flags);
 
+	f2fs_set_bio_ctx_fio(fio, bio);
 	__submit_bio(fio->sbi, bio, fio->type);
 
 	if (!is_read_io(fio->op))
 		inc_page_count(fio->sbi, WB_DATA_TYPE(fio->page));
 	return 0;
 }
+
+
+#ifdef CONFIG_F2FS_FS_ENCRYPTION
+static int f2fs_crypt_bio_not_mergeable(struct bio *bio, struct page *nxt)
+{
+	struct address_space *bio_mapping;
+	struct address_space *nxt_mapping;
+	struct page *p;
+
+	if (!hie_is_ready() || !bio || !nxt)
+		return 0;
+
+	p = bio_page(bio);
+
+	if (!p)
+		return 0;
+
+	bio_mapping = page_mapping(p);
+	nxt_mapping = page_mapping(nxt);
+
+	if (bio_mapping && nxt_mapping) {
+		if (!bio_mapping->host || !nxt_mapping->host)
+			return 0;
+
+		/* both not hw encrypted => don't care */
+		if (!fscrypt_is_hw_encrypt(bio_mapping->host) &&
+		    !fscrypt_is_hw_encrypt(nxt_mapping->host))
+			return 0;
+
+		/* different file => don't merge */
+		if (bio_mapping->host->i_ino != nxt_mapping->host->i_ino)
+			return 1;
+
+		/* discontiguous page index => don't merge */
+		if ((p->index + bio_segments(bio)) != (nxt->index))
+			return 1;
+	}
+
+	return 0;
+}
+#else
+static int f2fs_crypt_bio_not_mergeable(struct bio *bio struct page *nxt)
+{
+	return 0;
+}
+#endif
 
 int f2fs_submit_page_write(struct f2fs_io_info *fio)
 {
@@ -486,7 +535,7 @@ next:
 		spin_unlock(&io->io_lock);
 	}
 
-	if (__is_valid_data_blkaddr(fio->old_blkaddr))
+	if (fio->old_blkaddr != NEW_ADDR)
 		verify_block_addr(fio, fio->old_blkaddr);
 	verify_block_addr(fio, fio->new_blkaddr);
 
@@ -501,6 +550,10 @@ next:
 	    (io->fio.op != fio->op || io->fio.op_flags != fio->op_flags) ||
 			!__same_bdev(sbi, fio->new_blkaddr, io->bio)))
 		__submit_merged_bio(io);
+
+	if (f2fs_crypt_bio_not_mergeable(io->bio, bio_page))
+		__submit_merged_bio(io);
+
 alloc_new:
 	if (io->bio == NULL) {
 		if ((fio->type == DATA || fio->type == NODE) &&
@@ -550,6 +603,11 @@ static struct bio *f2fs_grab_read_bio(struct inode *inode, block_t blkaddr,
 	bio->bi_end_io = f2fs_read_end_io;
 	bio_set_op_attrs(bio, REQ_OP_READ, 0);
 
+	if (fscrypt_is_hw_encrypt(inode)) {
+		f2fs_wait_on_block_writeback(inode, blkaddr);
+		return bio;
+	}
+
 	if (f2fs_encrypted_file(inode))
 		post_read_steps |= 1 << STEP_DECRYPT;
 	if (post_read_steps) {
@@ -561,9 +619,6 @@ static struct bio *f2fs_grab_read_bio(struct inode *inode, block_t blkaddr,
 		ctx->bio = bio;
 		ctx->enabled_steps = post_read_steps;
 		bio->bi_private = ctx;
-
-		/* wait the page to be moved by cleaning */
-		f2fs_wait_on_block_writeback(sbi, blkaddr);
 	}
 
 	return bio;
@@ -578,10 +633,15 @@ static int f2fs_submit_page_read(struct inode *inode, struct page *page,
 	if (IS_ERR(bio))
 		return PTR_ERR(bio);
 
+	/* wait for GCed page writeback via META_MAPPING */
+	f2fs_wait_on_block_writeback(inode, blkaddr);
+
 	if (bio_add_page(bio, page, PAGE_SIZE, 0) < PAGE_SIZE) {
 		bio_put(bio);
 		return -EFAULT;
 	}
+
+	f2fs_set_bio_ctx(inode, bio);
 	__submit_bio(F2FS_I_SB(inode), bio, DATA);
 	return 0;
 }
@@ -1046,13 +1106,7 @@ next_dnode:
 next_block:
 	blkaddr = datablock_addr(dn.inode, dn.node_page, dn.ofs_in_node);
 
-	if (__is_valid_data_blkaddr(blkaddr) &&
-		!f2fs_is_valid_blkaddr(sbi, blkaddr, DATA_GENERIC)) {
-		err = -EFAULT;
-		goto sync_out;
-	}
-
-	if (!is_valid_data_blkaddr(sbi, blkaddr)) {
+	if (blkaddr == NEW_ADDR || blkaddr == NULL_ADDR) {
 		if (create) {
 			if (unlikely(f2fs_cp_error(sbi))) {
 				err = -EIO;
@@ -1502,10 +1556,6 @@ got_it:
 				SetPageUptodate(page);
 				goto confused;
 			}
-
-			if (!f2fs_is_valid_blkaddr(F2FS_I_SB(inode), block_nr,
-								DATA_GENERIC))
-				goto set_error_page;
 		} else {
 			zero_user_segment(page, 0, PAGE_SIZE);
 			if (!PageUptodate(page))
@@ -1521,9 +1571,14 @@ got_it:
 		if (bio && (last_block_in_bio != block_nr - 1 ||
 			!__same_bdev(F2FS_I_SB(inode), block_nr, bio))) {
 submit_and_realloc:
+			f2fs_set_bio_ctx(inode, bio);
 			__submit_bio(F2FS_I_SB(inode), bio, DATA);
 			bio = NULL;
 		}
+
+		if (f2fs_crypt_bio_not_mergeable(bio, page))
+			goto submit_and_realloc;
+
 		if (bio == NULL) {
 			bio = f2fs_grab_read_bio(inode, block_nr, nr_pages);
 			if (IS_ERR(bio)) {
@@ -1531,6 +1586,12 @@ submit_and_realloc:
 				goto set_error_page;
 			}
 		}
+
+		/*
+		 * If the page is under writeback, we need to wait for
+		 * its completion to see the correct decrypted data.
+		 */
+		f2fs_wait_on_block_writeback(inode, block_nr);
 
 		if (bio_add_page(bio, page, blocksize, 0) < blocksize)
 			goto submit_and_realloc;
@@ -1544,6 +1605,7 @@ set_error_page:
 		goto next_page;
 confused:
 		if (bio) {
+			f2fs_set_bio_ctx(inode, bio);
 			__submit_bio(F2FS_I_SB(inode), bio, DATA);
 			bio = NULL;
 		}
@@ -1553,8 +1615,10 @@ next_page:
 			put_page(page);
 	}
 	BUG_ON(pages && !list_empty(pages));
-	if (bio)
+	if (bio) {
+		f2fs_set_bio_ctx(inode, bio);
 		__submit_bio(F2FS_I_SB(inode), bio, DATA);
+	}
 	return 0;
 }
 
@@ -1598,7 +1662,10 @@ static int encrypt_one_page(struct f2fs_io_info *fio)
 		return 0;
 
 	/* wait for GCed page writeback via META_MAPPING */
-	f2fs_wait_on_block_writeback(fio->sbi, fio->old_blkaddr);
+	f2fs_wait_on_block_writeback(inode, fio->old_blkaddr);
+
+	if (fscrypt_is_hw_encrypt(inode))
+		return 0;
 
 retry_encrypt:
 	fio->encrypted_page = fscrypt_encrypt_page(inode, fio->page,
@@ -1734,7 +1801,6 @@ int do_write_data_page(struct f2fs_io_info *fio)
 	/* This page is already truncated */
 	if (fio->old_blkaddr == NULL_ADDR) {
 		ClearPageUptodate(page);
-		clear_cold_data(page);
 		goto out_writepage;
 	}
 got_it:
@@ -1770,12 +1836,6 @@ got_it:
 	if (err)
 		goto out_writepage;
 
-	if (__is_valid_data_blkaddr(fio->old_blkaddr) &&
-		!f2fs_is_valid_blkaddr(fio->sbi, fio->old_blkaddr,
-							DATA_GENERIC)) {
-		err = -EFAULT;
-		goto out_writepage;
-	}
 	set_page_writeback(page);
 	ClearPageError(page);
 
@@ -1802,7 +1862,7 @@ static int __write_data_page(struct page *page, bool *submitted,
 	loff_t i_size = i_size_read(inode);
 	const pgoff_t end_index = ((unsigned long long) i_size)
 							>> PAGE_SHIFT;
-	loff_t psize = (loff_t)(page->index + 1) << PAGE_SHIFT;
+	loff_t psize = (page->index + 1) << PAGE_SHIFT;
 	unsigned offset = 0;
 	bool need_balance_fs = false;
 	int err = 0;
@@ -1897,10 +1957,8 @@ done:
 
 out:
 	inode_dec_dirty_pages(inode);
-	if (err) {
+	if (err)
 		ClearPageUptodate(page);
-		clear_cold_data(page);
-	}
 
 	if (wbc->for_reclaim) {
 		f2fs_submit_merged_write_cond(sbi, inode, 0, page->index, DATA);
@@ -2326,10 +2384,6 @@ repeat:
 
 	f2fs_wait_on_page_writeback(page, DATA, false);
 
-	/* wait for GCed page writeback via META_MAPPING */
-	if (f2fs_post_read_required(inode))
-		f2fs_wait_on_block_writeback(sbi, blkaddr);
-
 	if (len == PAGE_SIZE || PageUptodate(page))
 		return 0;
 
@@ -2517,8 +2571,6 @@ void f2fs_invalidate_page(struct page *page, unsigned int offset,
 		}
 	}
 
-	clear_cold_data(page);
-
 	/* This is atomic written page, keep Private */
 	if (IS_ATOMIC_WRITTEN_PAGE(page))
 		return drop_inmem_page(inode, page);
@@ -2537,7 +2589,6 @@ int f2fs_release_page(struct page *page, gfp_t wait)
 	if (IS_ATOMIC_WRITTEN_PAGE(page))
 		return 0;
 
-	clear_cold_data(page);
 	set_page_private(page, 0);
 	ClearPagePrivate(page);
 	return 1;

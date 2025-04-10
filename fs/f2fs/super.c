@@ -26,6 +26,7 @@
 #include <linux/f2fs_fs.h>
 #include <linux/sysfs.h>
 #include <linux/quota.h>
+#include <linux/hie.h>
 
 #include "f2fs.h"
 #include "node.h"
@@ -1948,6 +1949,77 @@ static const struct fscrypt_operations f2fs_cryptops = {
 	.empty_dir	= f2fs_empty_dir,
 	.max_namelen	= f2fs_max_namelen,
 };
+
+int f2fs_set_bio_ctx(struct inode *inode, struct bio *bio)
+{
+	int ret;
+
+	ret = fscrypt_set_bio_ctx(inode, bio);
+
+	if (!ret && bio_encrypted(bio))
+		bio_bcf_set(bio, BC_IV_PAGE_IDX);
+
+	return ret;
+}
+
+int f2fs_set_bio_ctx_fio(struct f2fs_io_info *fio, struct bio *bio)
+{
+	int ret = 0;
+	struct address_space *mapping;
+
+	/* Don't attach bio ctx for sw encrypted pages,
+	 * including moving raw blocks in GC.
+	 */
+	if (fio->encrypted_page)
+		return 0;
+
+	mapping = page_mapping(fio->page);
+
+	if (mapping)
+		ret = f2fs_set_bio_ctx(mapping->host, bio);
+
+	return ret;
+}
+
+static int __f2fs_set_bio_ctx(struct inode *inode,
+	struct bio *bio)
+{
+	if (inode->i_sb->s_magic != F2FS_SUPER_MAGIC)
+		return -EINVAL;
+
+	return f2fs_set_bio_ctx(inode, bio);
+}
+
+static int __f2fs_key_payload(struct bio_crypt_ctx *ctx,
+	const char *data, const unsigned char **key)
+{
+	if (ctx->bc_fs_type != F2FS_SUPER_MAGIC)
+		return -EINVAL;
+
+	return fscrypt_key_payload(ctx, data, key);
+}
+
+struct hie_fs f2fs_hie = {
+	.name = "f2fs",
+	.key_payload = __f2fs_key_payload,
+	.set_bio_context = __f2fs_set_bio_ctx,
+	.priv = NULL,
+};
+
+#else
+static const struct fscrypt_operations f2fs_cryptops = {
+	.is_encrypted	= f2fs_encrypted_inode,
+};
+
+int f2fs_set_bio_ctx(struct inode *inode, struct bio *bio)
+{
+	return 0;
+}
+
+int f2fs_set_bio_ctx_fio(struct f2fs_io_info *fio, struct bio *bio)
+{
+	return 0;
+}
 #endif
 
 static struct inode *f2fs_nfs_get_inode(struct super_block *sb,
@@ -2139,8 +2211,6 @@ static inline bool sanity_check_area_boundary(struct f2fs_sb_info *sbi,
 static int sanity_check_raw_super(struct f2fs_sb_info *sbi,
 				struct buffer_head *bh)
 {
-	block_t segment_count, segs_per_sec, secs_per_zone;
-	block_t total_sections, blocks_per_seg;
 	struct f2fs_super_block *raw_super = (struct f2fs_super_block *)
 					(bh->b_data + F2FS_SUPER_OFFSET);
 	struct super_block *sb = sbi->sb;
@@ -2197,68 +2267,6 @@ static int sanity_check_raw_super(struct f2fs_sb_info *sbi,
 		return 1;
 	}
 
-	segment_count = le32_to_cpu(raw_super->segment_count);
-	segs_per_sec = le32_to_cpu(raw_super->segs_per_sec);
-	secs_per_zone = le32_to_cpu(raw_super->secs_per_zone);
-	total_sections = le32_to_cpu(raw_super->section_count);
-
-	/* blocks_per_seg should be 512, given the above check */
-	blocks_per_seg = 1 << le32_to_cpu(raw_super->log_blocks_per_seg);
-
-	if (segment_count > F2FS_MAX_SEGMENT ||
-				segment_count < F2FS_MIN_SEGMENTS) {
-		f2fs_msg(sb, KERN_INFO,
-			"Invalid segment count (%u)",
-			segment_count);
-		return 1;
-	}
-
-	if (total_sections > segment_count ||
-			total_sections < F2FS_MIN_SEGMENTS ||
-			segs_per_sec > segment_count || !segs_per_sec) {
-		f2fs_msg(sb, KERN_INFO,
-			"Invalid segment/section count (%u, %u x %u)",
-			segment_count, total_sections, segs_per_sec);
-		return 1;
-	}
-
-	if ((segment_count / segs_per_sec) < total_sections) {
-		f2fs_msg(sb, KERN_INFO,
-			"Small segment_count (%u < %u * %u)",
-			segment_count, segs_per_sec, total_sections);
-		return 1;
-	}
-
-	if (segment_count > (le64_to_cpu(raw_super->block_count) >> 9)) {
-		f2fs_msg(sb, KERN_INFO,
-			"Wrong segment_count / block_count (%u > %llu)",
-			segment_count, le64_to_cpu(raw_super->block_count));
-		return 1;
-	}
-
-	if (secs_per_zone > total_sections || !secs_per_zone) {
-		f2fs_msg(sb, KERN_INFO,
-			"Wrong secs_per_zone / total_sections (%u, %u)",
-			secs_per_zone, total_sections);
-		return 1;
-	}
-	if (le32_to_cpu(raw_super->extension_count) > F2FS_MAX_EXTENSION) {
-		f2fs_msg(sb, KERN_INFO,
-			"Corrupted extension count (%u > %u)",
-			le32_to_cpu(raw_super->extension_count),
-			F2FS_MAX_EXTENSION);
-		return 1;
-	}
-
-	if (le32_to_cpu(raw_super->cp_payload) >
-				(blocks_per_seg - F2FS_CP_PACKS)) {
-		f2fs_msg(sb, KERN_INFO,
-			"Insane cp_payload (%u > %u)",
-			le32_to_cpu(raw_super->cp_payload),
-			blocks_per_seg - F2FS_CP_PACKS);
-		return 1;
-	}
-
 	/* check reserved ino info */
 	if (le32_to_cpu(raw_super->node_ino) != 1 ||
 		le32_to_cpu(raw_super->meta_ino) != 2 ||
@@ -2268,6 +2276,13 @@ static int sanity_check_raw_super(struct f2fs_sb_info *sbi,
 			le32_to_cpu(raw_super->node_ino),
 			le32_to_cpu(raw_super->meta_ino),
 			le32_to_cpu(raw_super->root_ino));
+		return 1;
+	}
+
+	if (le32_to_cpu(raw_super->segment_count) > F2FS_MAX_SEGMENT) {
+		f2fs_msg(sb, KERN_INFO,
+			"Invalid segment count (%u)",
+			le32_to_cpu(raw_super->segment_count));
 		return 1;
 	}
 
@@ -2285,20 +2300,12 @@ int sanity_check_ckpt(struct f2fs_sb_info *sbi)
 	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);
 	unsigned int ovp_segments, reserved_segments;
 	unsigned int main_segs, blocks_per_seg;
-	unsigned int sit_segs, nat_segs;
-	unsigned int sit_bitmap_size, nat_bitmap_size;
-	unsigned int log_blocks_per_seg;
-	unsigned int segment_count_main;
-	unsigned int cp_pack_start_sum, cp_payload;
-	block_t user_block_count;
-	int i, j;
+	int i;
 
 	total = le32_to_cpu(raw_super->segment_count);
 	fsmeta = le32_to_cpu(raw_super->segment_count_ckpt);
-	sit_segs = le32_to_cpu(raw_super->segment_count_sit);
-	fsmeta += sit_segs;
-	nat_segs = le32_to_cpu(raw_super->segment_count_nat);
-	fsmeta += nat_segs;
+	fsmeta += le32_to_cpu(raw_super->segment_count_sit);
+	fsmeta += le32_to_cpu(raw_super->segment_count_nat);
 	fsmeta += le32_to_cpu(ckpt->rsvd_segment_count);
 	fsmeta += le32_to_cpu(raw_super->segment_count_ssa);
 
@@ -2315,16 +2322,6 @@ int sanity_check_ckpt(struct f2fs_sb_info *sbi)
 		return 1;
 	}
 
-	user_block_count = le64_to_cpu(ckpt->user_block_count);
-	segment_count_main = le32_to_cpu(raw_super->segment_count_main);
-	log_blocks_per_seg = le32_to_cpu(raw_super->log_blocks_per_seg);
-	if (!user_block_count || user_block_count >=
-			segment_count_main << log_blocks_per_seg) {
-		f2fs_msg(sbi->sb, KERN_ERR,
-			"Wrong user_block_count: %u", user_block_count);
-		return 1;
-	}
-
 	main_segs = le32_to_cpu(raw_super->segment_count_main);
 	blocks_per_seg = sbi->blocks_per_seg;
 
@@ -2332,65 +2329,11 @@ int sanity_check_ckpt(struct f2fs_sb_info *sbi)
 		if (le32_to_cpu(ckpt->cur_node_segno[i]) >= main_segs ||
 			le16_to_cpu(ckpt->cur_node_blkoff[i]) >= blocks_per_seg)
 			return 1;
-		for (j = i + 1; j < NR_CURSEG_NODE_TYPE; j++) {
-			if (le32_to_cpu(ckpt->cur_node_segno[i]) ==
-				le32_to_cpu(ckpt->cur_node_segno[j])) {
-				f2fs_msg(sbi->sb, KERN_ERR,
-					"Node segment (%u, %u) has the same "
-					"segno: %u", i, j,
-					le32_to_cpu(ckpt->cur_node_segno[i]));
-				return 1;
-			}
-		}
 	}
 	for (i = 0; i < NR_CURSEG_DATA_TYPE; i++) {
 		if (le32_to_cpu(ckpt->cur_data_segno[i]) >= main_segs ||
 			le16_to_cpu(ckpt->cur_data_blkoff[i]) >= blocks_per_seg)
 			return 1;
-		for (j = i + 1; j < NR_CURSEG_DATA_TYPE; j++) {
-			if (le32_to_cpu(ckpt->cur_data_segno[i]) ==
-				le32_to_cpu(ckpt->cur_data_segno[j])) {
-				f2fs_msg(sbi->sb, KERN_ERR,
-					"Data segment (%u, %u) has the same "
-					"segno: %u", i, j,
-					le32_to_cpu(ckpt->cur_data_segno[i]));
-				return 1;
-			}
-		}
-	}
-	for (i = 0; i < NR_CURSEG_NODE_TYPE; i++) {
-		for (j = 0; j < NR_CURSEG_DATA_TYPE; j++) {
-			if (le32_to_cpu(ckpt->cur_node_segno[i]) ==
-				le32_to_cpu(ckpt->cur_data_segno[j])) {
-				f2fs_msg(sbi->sb, KERN_ERR,
-					"Node segment (%u) and Data segment (%u)"
-					" has the same segno: %u", i, j,
-					le32_to_cpu(ckpt->cur_node_segno[i]));
-				return 1;
-			}
-		}
-	}
-
-	sit_bitmap_size = le32_to_cpu(ckpt->sit_ver_bitmap_bytesize);
-	nat_bitmap_size = le32_to_cpu(ckpt->nat_ver_bitmap_bytesize);
-
-	if (sit_bitmap_size != ((sit_segs / 2) << log_blocks_per_seg) / 8 ||
-		nat_bitmap_size != ((nat_segs / 2) << log_blocks_per_seg) / 8) {
-		f2fs_msg(sbi->sb, KERN_ERR,
-			"Wrong bitmap size: sit: %u, nat:%u",
-			sit_bitmap_size, nat_bitmap_size);
-		return 1;
-	}
-
-	cp_pack_start_sum = __start_sum_addr(sbi);
-	cp_payload = __cp_payload(sbi);
-	if (cp_pack_start_sum < cp_payload + 1 ||
-		cp_pack_start_sum > blocks_per_seg - 1 -
-			NR_CURSEG_TYPE) {
-		f2fs_msg(sbi->sb, KERN_ERR,
-			"Wrong cp_pack_start_sum: %u",
-			cp_pack_start_sum);
-		return 1;
 	}
 
 	if (unlikely(f2fs_cp_error(sbi))) {
@@ -2454,12 +2397,8 @@ static int init_percpu_info(struct f2fs_sb_info *sbi)
 	if (err)
 		return err;
 
-	err = percpu_counter_init(&sbi->total_valid_inode_count, 0,
+	return percpu_counter_init(&sbi->total_valid_inode_count, 0,
 								GFP_KERNEL);
-	if (err)
-		percpu_counter_destroy(&sbi->alloc_valid_block_count);
-
-	return err;
 }
 
 #ifdef CONFIG_BLK_DEV_ZONED
@@ -3242,6 +3181,11 @@ static int __init init_f2fs_fs(void)
 	err = f2fs_init_post_read_processing();
 	if (err)
 		goto free_root_stats;
+
+#ifdef CONFIG_F2FS_FS_ENCRYPTION
+	hie_register_fs(&f2fs_hie);
+#endif
+
 	return 0;
 
 free_root_stats:

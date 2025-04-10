@@ -695,23 +695,11 @@ static ssize_t bm_register_write(struct file *file, const char __user *buffer,
 	struct super_block *sb = file_inode(file)->i_sb;
 	struct dentry *root = sb->s_root, *dentry;
 	int err = 0;
-	struct file *f = NULL;
 
 	e = create_entry(buffer, count);
 
 	if (IS_ERR(e))
 		return PTR_ERR(e);
-
-	if (e->flags & MISC_FMT_OPEN_FILE) {
-		f = open_exec(e->interpreter);
-		if (IS_ERR(f)) {
-			pr_notice("register: failed to install interpreter file %s\n",
-				 e->interpreter);
-			kfree(e);
-			return PTR_ERR(f);
-		}
-		e->interp_file = f;
-	}
 
 	inode_lock(d_inode(root));
 	dentry = lookup_one_len(e->name, root, strlen(e->name));
@@ -736,6 +724,21 @@ static ssize_t bm_register_write(struct file *file, const char __user *buffer,
 		goto out2;
 	}
 
+	if (e->flags & MISC_FMT_OPEN_FILE) {
+		struct file *f;
+
+		f = open_exec(e->interpreter);
+		if (IS_ERR(f)) {
+			err = PTR_ERR(f);
+			pr_notice("register: failed to install interpreter file %s\n", e->interpreter);
+			simple_release_fs(&bm_mnt, &entry_count);
+			iput(inode);
+			inode = NULL;
+			goto out2;
+		}
+		e->interp_file = f;
+	}
+
 	e->dentry = dget(dentry);
 	inode->i_private = e;
 	inode->i_fop = &bm_entry_operations;
@@ -752,8 +755,6 @@ out:
 	inode_unlock(d_inode(root));
 
 	if (err) {
-		if (f)
-			filp_close(f, NULL);
 		kfree(e);
 		return err;
 	}
@@ -823,7 +824,7 @@ static const struct super_operations s_ops = {
 static int bm_fill_super(struct super_block *sb, void *data, int silent)
 {
 	int err;
-	static struct tree_descr bm_files[] = {
+	static const struct tree_descr bm_files[] = {
 		[2] = {"status", &bm_status_operations, S_IWUSR|S_IRUGO},
 		[3] = {"register", &bm_register_operations, S_IWUSR},
 		/* last one */ {""}

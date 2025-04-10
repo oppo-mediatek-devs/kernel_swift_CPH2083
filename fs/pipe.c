@@ -28,20 +28,9 @@
 
 #include "internal.h"
 
-/*
- * New pipe buffers will be restricted to this size while the user is exceeding
- * their pipe buffer quota. The general pipe use case needs at least two
- * buffers: one for data yet to be read, and one for new data. If this is less
- * than two, then a write to a non-empty pipe may block even if the pipe is not
- * full. This can occur with GNU make jobserver or similar uses of pipes as
- * semaphores: multiple processes may be waiting to write tokens back to the
- * pipe before reading tokens: https://lore.kernel.org/lkml/1628086770.5rn8p04n6j.none@localhost/.
- *
- * Users can reduce their pipe buffers with F_SETPIPE_SZ below this at their
- * own risk, namely: pipe writes to non-full pipes may block until the pipe is
- * emptied.
- */
-#define PIPE_MIN_DEF_BUFFERS 2
+#ifdef CONFIG_MTK_FD_LEAK_SPECIFIC_DEBUG
+#include <mt-plat/aee.h>
+#endif
 
 /*
  * The max size that a non-root user is allowed to grow the pipe. Can
@@ -208,9 +197,9 @@ EXPORT_SYMBOL(generic_pipe_buf_steal);
  *	in the tee() system call, when we duplicate the buffers in one
  *	pipe into another.
  */
-bool generic_pipe_buf_get(struct pipe_inode_info *pipe, struct pipe_buffer *buf)
+void generic_pipe_buf_get(struct pipe_inode_info *pipe, struct pipe_buffer *buf)
 {
-	return try_get_page(buf->page);
+	get_page(buf->page);
 }
 EXPORT_SYMBOL(generic_pipe_buf_get);
 
@@ -253,14 +242,6 @@ static const struct pipe_buf_operations anon_pipe_buf_ops = {
 	.get = generic_pipe_buf_get,
 };
 
-static const struct pipe_buf_operations anon_pipe_buf_nomerge_ops = {
-	.can_merge = 0,
-	.confirm = generic_pipe_buf_confirm,
-	.release = anon_pipe_buf_release,
-	.steal = anon_pipe_buf_steal,
-	.get = generic_pipe_buf_get,
-};
-
 static const struct pipe_buf_operations packet_pipe_buf_ops = {
 	.can_merge = 0,
 	.confirm = generic_pipe_buf_confirm,
@@ -268,12 +249,6 @@ static const struct pipe_buf_operations packet_pipe_buf_ops = {
 	.steal = anon_pipe_buf_steal,
 	.get = generic_pipe_buf_get,
 };
-
-void pipe_buf_mark_unmergeable(struct pipe_buffer *buf)
-{
-	if (buf->ops == &anon_pipe_buf_ops)
-		buf->ops = &anon_pipe_buf_nomerge_ops;
-}
 
 static ssize_t
 pipe_read(struct kiocb *iocb, struct iov_iter *to)
@@ -668,8 +643,8 @@ struct pipe_inode_info *alloc_pipe_info(void)
 	user_bufs = account_pipe_buffers(user, 0, pipe_bufs);
 
 	if (too_many_pipe_buffers_soft(user_bufs) && is_unprivileged_user()) {
-		user_bufs = account_pipe_buffers(user, pipe_bufs, PIPE_MIN_DEF_BUFFERS);
-		pipe_bufs = PIPE_MIN_DEF_BUFFERS;
+		user_bufs = account_pipe_buffers(user, pipe_bufs, 1);
+		pipe_bufs = 1;
 	}
 
 	if (too_many_pipe_buffers_hard(user_bufs) && is_unprivileged_user())
@@ -820,6 +795,11 @@ err_inode:
 	return err;
 }
 
+#ifdef CONFIG_MTK_FD_LEAK_SPECIFIC_DEBUG
+#define MSG_SIZE_TO_AEE 70
+char msg_to_aee[MSG_SIZE_TO_AEE];
+#endif
+
 static int __do_pipe_flags(int *fd, struct file **files, int flags)
 {
 	int error;
@@ -852,6 +832,22 @@ static int __do_pipe_flags(int *fd, struct file **files, int flags)
  err_read_pipe:
 	fput(files[0]);
 	fput(files[1]);
+#ifdef CONFIG_MTK_FD_LEAK_SPECIFIC_DEBUG
+	if (fdr >= 1023 || fdw >= 1023) {
+		snprintf(msg_to_aee, MSG_SIZE_TO_AEE, "[FDLEAK] [pid:%d] %s\n",
+			current->pid, current->comm);
+		aee_kernel_warning_api("FDLEAK_DEBUG", 0, DB_OPT_DEFAULT |
+			DB_OPT_LOW_MEMORY_KILLER |
+			DB_OPT_PID_MEMORY_INFO | /* smaps and hprof*/
+			DB_OPT_NATIVE_BACKTRACE |
+			DB_OPT_DUMPSYS_ACTIVITY |
+			DB_OPT_PROCESS_COREDUMP |
+			DB_OPT_DUMPSYS_SURFACEFLINGER |
+			DB_OPT_DUMPSYS_GFXINFO |
+			DB_OPT_DUMPSYS_PROCSTATS,
+			"show kernel & natvie backtace\n", msg_to_aee);
+	}
+#endif
 	return error;
 }
 

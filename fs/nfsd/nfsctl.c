@@ -765,10 +765,7 @@ out_close:
 		svc_xprt_put(xprt);
 	}
 out_err:
-	if (!list_empty(&nn->nfsd_serv->sv_permsocks))
-		nn->nfsd_serv->sv_nrthreads--;
-	 else
-		nfsd_destroy(net);
+	nfsd_destroy(net);
 	return err;
 }
 
@@ -1106,8 +1103,6 @@ static ssize_t write_v4_end_grace(struct file *file, char *buf, size_t size)
 		case 'Y':
 		case 'y':
 		case '1':
-			if (!nn->nfsd_serv)
-				return -EBUSY;
 			nfsd4_end_grace(nn);
 			break;
 		default:
@@ -1128,7 +1123,7 @@ static ssize_t write_v4_end_grace(struct file *file, char *buf, size_t size)
 
 static int nfsd_fill_super(struct super_block * sb, void * data, int silent)
 {
-	static struct tree_descr nfsd_files[] = {
+	static const struct tree_descr nfsd_files[] = {
 		[NFSD_List] = {"exports", &exports_nfsd_operations, S_IRUGO},
 		[NFSD_Export_features] = {"export_features",
 					&export_features_operations, S_IRUGO},
